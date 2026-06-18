@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AnnouncementsModule } from './announcements/announcements.module';
+import { GalleryModule } from './gallery/gallery.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { AuthModule } from './auth/auth.module';
 import { BadgesModule } from './badges/badges.module';
@@ -30,6 +31,7 @@ import { RedisModule } from './lib/redis.module';
     LeaderboardModule,
     BadgesModule,
     AnnouncementsModule,
+    GalleryModule,
     NotificationsModule,
   ],
 })

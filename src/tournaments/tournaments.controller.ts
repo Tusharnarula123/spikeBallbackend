@@ -48,6 +48,13 @@ export class TournamentsController {
     return this.tournaments.update(id, body);
   }
 
+  @Delete(':id')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.OK)
+  deleteTournament(@Param('id') id: string) {
+    return this.tournaments.deleteTournament(id);
+  }
+
   @Post(':id/register')
   @HttpCode(HttpStatus.CREATED)
   register(
@@ -79,6 +86,20 @@ export class TournamentsController {
   @HttpCode(HttpStatus.CREATED)
   generateBracket(@Param('id') id: string) {
     return this.tournaments.generateBracket(id);
+  }
+
+  @Post(':id/generate-round-robin')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.CREATED)
+  generateRoundRobin(@Param('id') id: string) {
+    return this.tournaments.generateRoundRobin(id);
+  }
+
+  @Post(':id/generate-finals')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.CREATED)
+  generateRRFinals(@Param('id') id: string) {
+    return this.tournaments.generateRRFinals(id);
   }
 
   @Post(':id/form-teams')

@@ -17,14 +17,14 @@ const STATIC_ANNOUNCEMENTS: Announcement[] = [
     id: 'static-elo',
     type: 'update',
     title: '🆕 ELO System Live',
-    body: 'K-factor is 60 for placement matches (first 10) and 24 after. Check the ELO guide on your dashboard for the full breakdown.',
+    body: 'K-factor is 60 for placement matches (first 5) and 24 after. Check the ELO guide on your dashboard for the full breakdown.',
     date: '2025-02-15',
   },
   {
     id: 'static-welcome',
     type: 'general',
     title: '👋 Welcome New Members!',
-    body: 'Complete your 10 placement matches to appear on the official leaderboard.',
+    body: 'Complete your 5 placement matches to appear on the official leaderboard.',
     date: '2025-01-20',
   },
 ];
