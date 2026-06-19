@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { AboutModule } from './about/about.module';
 import { AnnouncementsModule } from './announcements/announcements.module';
 import { GalleryModule } from './gallery/gallery.module';
 import { NotificationsModule } from './notifications/notifications.module';
@@ -33,6 +34,7 @@ import { RedisModule } from './lib/redis.module';
     AnnouncementsModule,
     GalleryModule,
     NotificationsModule,
+    AboutModule,
   ],
 })
 export class AppModule {}

@@ -1,5 +1,6 @@
 import {
   Controller,
+  Delete,
   Get,
   HttpCode,
   HttpStatus,
@@ -52,5 +53,22 @@ export class NotificationsController {
     @Param('id', ParseUUIDPipe) id: string,
   ) {
     return this.notifications.markRead(auth, id);
+  }
+
+  /** DELETE /notifications/read — clear all read notifications */
+  @Delete('read')
+  @HttpCode(HttpStatus.OK)
+  deleteRead(@AuthUser() auth: ClerkUser) {
+    return this.notifications.deleteRead(auth);
+  }
+
+  /** DELETE /notifications/:id — remove a single notification (e.g. once acted on) */
+  @Delete(':id')
+  @HttpCode(HttpStatus.OK)
+  deleteOne(
+    @AuthUser() auth: ClerkUser,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return this.notifications.deleteOne(auth, id);
   }
 }

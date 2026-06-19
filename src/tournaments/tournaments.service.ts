@@ -11,6 +11,7 @@ interface Registration {
   player_id: string;
   preferred_partner_id: string | null;
   team_id: string | null;
+  team_name: string | null;
 }
 
 @Injectable()
@@ -196,13 +197,19 @@ export class TournamentsService {
     const player = await getPlayerByClerkId(this.supabase, auth.userId);
     if (!player) apiError('Player not found', HttpStatus.NOT_FOUND);
 
+    // Suspended players are removed from tournament pools on suspension (see
+    // PlayersService.suspend); they also shouldn't see tournaments they were
+    // previously registered for, even ones already locked/in progress.
+    if (player.status === 'suspended') return [];
+
     const { data, error } = await this.supabase.db
       .from('tournament_registrations')
       .select(`
-        id, registered_at, preferred_partner_id, team_id,
+        id, tournament_id, registered_at, preferred_partner_id, team_id, team_name,
         tournament:tournaments ( * ),
+        requested_partner:players!preferred_partner_id ( id, first_name, last_name ),
         team:tournament_teams!team_id (
-          id, player1_id, player2_id,
+          id, player1_id, player2_id, team_name,
           player1:players!player1_id ( id, first_name, last_name ),
           player2:players!player2_id ( id, first_name, last_name )
         )
@@ -211,8 +218,37 @@ export class TournamentsService {
       .order('registered_at', { ascending: false });
 
     if (error) apiError(error.message);
+    const rows = (data ?? []) as Record<string, unknown>[];
 
-    return (data ?? []).map((row: Record<string, unknown>) => {
+    // For rows where a partner was requested but no team has formed yet, check
+    // whether that partner's own registration points back at us (mutual match) —
+    // e.g. they accepted our invite — so the UI can say "matched" instead of
+    // "pending" even before an admin runs team formation.
+    const pendingPairs = rows.filter((r) => r.preferred_partner_id && !r.team_id);
+    const mutualMap = new Map<string, boolean>(); // key: `${tournament_id}:${preferred_partner_id}`
+
+    if (pendingPairs.length > 0) {
+      const tournamentIds = [...new Set(pendingPairs.map((r) => r.tournament_id as string))];
+      const partnerIds = [...new Set(pendingPairs.map((r) => r.preferred_partner_id as string))];
+
+      const { data: partnerRegs } = await this.supabase.db
+        .from('tournament_registrations')
+        .select('tournament_id, player_id, preferred_partner_id')
+        .in('tournament_id', tournamentIds)
+        .in('player_id', partnerIds);
+
+      for (const r of pendingPairs) {
+        const match = (partnerRegs ?? []).find(
+          (pr) =>
+            pr.tournament_id === r.tournament_id &&
+            pr.player_id === r.preferred_partner_id &&
+            pr.preferred_partner_id === player.id,
+        );
+        mutualMap.set(`${r.tournament_id}:${r.preferred_partner_id}`, !!match);
+      }
+    }
+
+    return rows.map((row) => {
       let partner: { id: string; name: string } | null = null;
       const team = row.team as Record<string, unknown> | null;
       if (team) {
@@ -227,13 +263,29 @@ export class TournamentsService {
           };
         }
       }
+
+      const requestedPartnerRow = row.requested_partner as
+        | { id: string; first_name: string; last_name: string }
+        | null;
+      const requestedPartner = requestedPartnerRow
+        ? { id: requestedPartnerRow.id, name: `${requestedPartnerRow.first_name} ${requestedPartnerRow.last_name}` }
+        : null;
+
+      const isMutualMatch =
+        !!row.preferred_partner_id &&
+        !row.team_id &&
+        !!mutualMap.get(`${row.tournament_id}:${row.preferred_partner_id}`);
+
       return {
         registrationId: row.id,
         registeredAt: row.registered_at,
         preferredPartnerId: row.preferred_partner_id,
         tournament: row.tournament,
         teamId: row.team_id,
+        teamName: (team?.team_name as string | null) ?? (row.team_name as string | null) ?? null,
         partner,
+        requestedPartner,
+        isMutualMatch,
       };
     });
   }
@@ -260,12 +312,18 @@ export class TournamentsService {
       apiError('You cannot select yourself as a teammate');
     }
 
+    // Team name is only meaningful when players pick their own teammate.
+    const rawTeamName = (body?.teamName as string | null | undefined)?.trim();
+    const teamName =
+      tournament.team_formation === 'self_select' && rawTeamName ? rawTeamName : null;
+
     const { data, error } = await this.supabase.db
       .from('tournament_registrations')
       .insert({
         tournament_id: tournamentId,
         player_id: player.id,
         preferred_partner_id: preferredPartnerId,
+        team_name: teamName,
       })
       .select()
       .single();
@@ -276,7 +334,165 @@ export class TournamentsService {
       }
       apiError(error.message);
     }
+
+    // Notify the chosen partner that someone wants to team up with them.
+    if (preferredPartnerId) {
+      this.notifyPartnerInvite(player, preferredPartnerId, tournament, tournamentId).catch(
+        (err) => console.error('[TournamentsService] partner invite notification failed:', err),
+      );
+    }
+
     return data;
+  }
+
+  /** Fire-and-forget notification + email telling a player someone wants to team up with them. */
+  private async notifyPartnerInvite(
+    inviter: { id: string; first_name: string; last_name: string },
+    partnerId: string,
+    tournament: { name: string },
+    tournamentId: string,
+  ) {
+    const { data: partner } = await this.supabase.db
+      .from('players')
+      .select('id, first_name, last_name, email')
+      .eq('id', partnerId)
+      .single();
+    if (!partner) return;
+
+    const inviterName = `${inviter.first_name} ${inviter.last_name}`;
+    const link = '/dashboard/register';
+    const title = `${inviterName} wants to team up with you!`;
+    const body = `${inviterName} picked you as their preferred teammate for ${tournament.name}. Accept to lock in your team, or decline if you'd rather pick someone else.`;
+
+    await Promise.allSettled([
+      this.notifs.create({
+        playerId: partner.id,
+        type: 'partner_invite',
+        title,
+        body,
+        link,
+        data: { tournamentId, inviterId: inviter.id, tournamentName: tournament.name },
+      }),
+      partner.email
+        ? this.mail.sendNotification({
+            to: partner.email,
+            subject: `Team invite: ${tournament.name}`,
+            title,
+            body,
+            link,
+            linkLabel: 'Respond to Invite',
+          })
+        : Promise.resolve(),
+    ]);
+  }
+
+  /** Responder accepts a partner invite: sets/creates their registration with preferred_partner_id = inviter. */
+  async acceptInvite(auth: ClerkUser, tournamentId: string, inviterId: string) {
+    const responder = await getPlayerByClerkId(this.supabase, auth.userId);
+    if (!responder) apiError('Player not found', HttpStatus.NOT_FOUND);
+    if (inviterId === responder.id) apiError('Invalid invite');
+
+    const { data: tournament } = await this.supabase.db
+      .from('tournaments')
+      .select('*')
+      .eq('id', tournamentId)
+      .single();
+    if (!tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
+    if (tournament.status !== 'registration_open') {
+      apiError('Registration is not open for this tournament');
+    }
+
+    const { data: existingReg } = await this.supabase.db
+      .from('tournament_registrations')
+      .select('id, team_id')
+      .eq('tournament_id', tournamentId)
+      .eq('player_id', responder.id)
+      .maybeSingle();
+
+    if (existingReg) {
+      if (existingReg.team_id) apiError('You are already on a team for this tournament');
+      const { error } = await this.supabase.db
+        .from('tournament_registrations')
+        .update({ preferred_partner_id: inviterId })
+        .eq('id', existingReg.id);
+      if (error) apiError(error.message);
+    } else {
+      const { error } = await this.supabase.db.from('tournament_registrations').insert({
+        tournament_id: tournamentId,
+        player_id: responder.id,
+        preferred_partner_id: inviterId,
+      });
+      if (error) apiError(error.message);
+    }
+
+    this.notifyInviteResponse(responder, inviterId, tournament, true).catch((err) =>
+      console.error('[TournamentsService] accept-invite notification failed:', err),
+    );
+
+    return { success: true };
+  }
+
+  /** Responder declines a partner invite: no registration change, just lets the inviter know. */
+  async declineInvite(auth: ClerkUser, tournamentId: string, inviterId: string) {
+    const responder = await getPlayerByClerkId(this.supabase, auth.userId);
+    if (!responder) apiError('Player not found', HttpStatus.NOT_FOUND);
+
+    const { data: tournament } = await this.supabase.db
+      .from('tournaments')
+      .select('name')
+      .eq('id', tournamentId)
+      .single();
+    if (!tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
+
+    this.notifyInviteResponse(responder, inviterId, tournament, false).catch((err) =>
+      console.error('[TournamentsService] decline-invite notification failed:', err),
+    );
+
+    return { success: true };
+  }
+
+  /** Lets the original inviter know whether their partner invite was accepted or declined. */
+  private async notifyInviteResponse(
+    responder: { id: string; first_name: string; last_name: string },
+    inviterId: string,
+    tournament: { name: string },
+    accepted: boolean,
+  ) {
+    const { data: inviter } = await this.supabase.db
+      .from('players')
+      .select('id, first_name, last_name, email')
+      .eq('id', inviterId)
+      .single();
+    if (!inviter) return;
+
+    const responderName = `${responder.first_name} ${responder.last_name}`;
+    const link = '/dashboard/register';
+    const title = accepted
+      ? `${responderName} accepted your team invite!`
+      : `${responderName} declined your team invite`;
+    const body = accepted
+      ? `${responderName} accepted your invite to team up for ${tournament.name}. Your team will be locked in when the admin forms teams.`
+      : `${responderName} isn't able to team up with you for ${tournament.name}. You may want to pick a different teammate.`;
+
+    await Promise.allSettled([
+      this.notifs.create({
+        playerId: inviter.id,
+        type: 'partner_invite_response',
+        title,
+        body,
+        link,
+      }),
+      inviter.email
+        ? this.mail.sendNotification({
+            to: inviter.email,
+            subject: `${accepted ? 'Invite accepted' : 'Invite declined'}: ${tournament.name}`,
+            title,
+            body,
+            link,
+            linkLabel: 'View Registration',
+          })
+        : Promise.resolve(),
+    ]);
   }
 
   async unregister(auth: ClerkUser, tournamentId: string) {
@@ -306,10 +522,10 @@ export class TournamentsService {
     const { data, error } = await this.supabase.db
       .from('tournament_registrations')
       .select(`
-        id, registered_at, preferred_partner_id, team_id,
+        id, registered_at, preferred_partner_id, team_id, team_name,
         player:players!player_id ( id, first_name, last_name, email, age, gender, university, current_elo ),
         preferred_partner:players!preferred_partner_id ( id, first_name, last_name ),
-        team:tournament_teams!team_id ( id, player1_id, player2_id )
+        team:tournament_teams!team_id ( id, player1_id, player2_id, team_name )
       `)
       .eq('tournament_id', tournamentId)
       .order('registered_at', { ascending: true });
@@ -775,7 +991,7 @@ export class TournamentsService {
 
     const { data: registrations, error: regError } = await this.supabase.db
       .from('tournament_registrations')
-      .select('id, player_id, preferred_partner_id, team_id')
+      .select('id, player_id, preferred_partner_id, team_id, team_name')
       .eq('tournament_id', tournamentId)
       .is('team_id', null);
 
@@ -831,9 +1047,15 @@ export class TournamentsService {
     const tournamentLink = `/dashboard/tournaments/${tournamentId}`;
 
     for (const [p1, p2] of pairs) {
+      // If either partner gave the team a name at registration, use it
+      // (preferring whichever registration was created first).
+      const reg1 = byPlayer.get(p1);
+      const reg2 = byPlayer.get(p2);
+      const teamName = reg1?.team_name ?? reg2?.team_name ?? null;
+
       const { data: team, error: teamError } = await this.supabase.db
         .from('tournament_teams')
-        .insert({ tournament_id: tournamentId, player1_id: p1, player2_id: p2 })
+        .insert({ tournament_id: tournamentId, player1_id: p1, player2_id: p2, team_name: teamName })
         .select()
         .single();
       if (teamError) apiError(teamError.message);

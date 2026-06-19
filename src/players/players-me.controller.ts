@@ -1,6 +1,8 @@
-import { Body, Controller, Get, Patch, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Patch, Post, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { AuthUser } from '../auth/auth-user.decorator';
 import type { ClerkUser } from '../auth/auth.types';
+import { apiError } from '../common/api-error';
 import { PlayersService } from './players.service';
 
 /** Separate controller so /players/me never collides with /players/:id */
@@ -16,6 +18,18 @@ export class PlayersMeController {
   @Patch()
   updateMe(@AuthUser() auth: ClerkUser, @Body() body: Record<string, unknown>) {
     return this.players.updateMe(auth, body);
+  }
+
+  @Post('avatar')
+  @UseInterceptors(FileInterceptor('avatar'))
+  uploadAvatar(@AuthUser() auth: ClerkUser, @UploadedFile() file: Express.Multer.File) {
+    if (!file) apiError('No file uploaded');
+    return this.players.uploadAvatar(auth, file.buffer);
+  }
+
+  @Delete('avatar')
+  removeAvatar(@AuthUser() auth: ClerkUser) {
+    return this.players.removeAvatar(auth);
   }
 
   @Get('alltime')

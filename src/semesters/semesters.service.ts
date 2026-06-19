@@ -131,6 +131,42 @@ export class SemestersService {
     return semester;
   }
 
+  /**
+   * Delete a season (and its semesters), as long as it's not active and has
+   * no matches recorded against it — those constraints keep ELO history and
+   * match records from being silently orphaned.
+   */
+  async deleteSeason(id: string) {
+    const { data: season, error: seasonErr } = await this.supabase.db
+      .from('seasons')
+      .select('id, name, is_active')
+      .eq('id', id)
+      .maybeSingle();
+    if (seasonErr) apiError(seasonErr.message);
+    if (!season) apiError('Season not found', HttpStatus.NOT_FOUND);
+
+    if (season.is_active) {
+      apiError('Cannot delete the active season — activate a different semester first');
+    }
+
+    const { count, error: matchErr } = await this.supabase.db
+      .from('matches')
+      .select('id', { count: 'exact', head: true })
+      .eq('season_id', id);
+    if (matchErr) apiError(matchErr.message);
+    if (count && count > 0) {
+      apiError(`Cannot delete "${season.name}" — it has ${count} recorded match${count === 1 ? '' : 'es'}`);
+    }
+
+    const { error: semErr } = await this.supabase.db.from('semesters').delete().eq('season_id', id);
+    if (semErr) apiError(semErr.message);
+
+    const { error: delErr } = await this.supabase.db.from('seasons').delete().eq('id', id);
+    if (delErr) apiError(delErr.message);
+
+    return { success: true };
+  }
+
   async updateSemester(id: string, body: Record<string, unknown>) {
     const allowed = ['name', 'startDate', 'endDate', 'startingElo'] as const;
     const fieldMap: Record<string, string> = {

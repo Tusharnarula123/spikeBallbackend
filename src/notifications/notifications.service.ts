@@ -6,10 +6,17 @@ import { SupabaseService } from '../supabase/supabase.service';
 
 export interface CreateNotificationInput {
   playerId: string;
-  type: 'team_assigned' | 'match_submitted' | 'match_approved' | 'general';
+  type:
+    | 'team_assigned'
+    | 'partner_invite'
+    | 'partner_invite_response'
+    | 'match_submitted'
+    | 'match_approved'
+    | 'general';
   title: string;
   body: string;
   link?: string;
+  data?: Record<string, unknown>;
 }
 
 @Injectable()
@@ -26,6 +33,7 @@ export class NotificationsService {
       title: n.title,
       body: n.body,
       link: n.link ?? null,
+      data: n.data ?? null,
     }));
 
     const { error } = await this.supabase.db.from('notifications').insert(inserts);
@@ -93,6 +101,61 @@ export class NotificationsService {
       .update({ is_read: true })
       .eq('player_id', player.id)
       .eq('is_read', false);
+
+    if (error) apiError(error.message);
+    return { success: true };
+  }
+
+  /** Delete a single notification owned by the player (e.g. once acted on). */
+  async deleteOne(auth: ClerkUser, notificationId: string) {
+    const player = await getPlayerByClerkId(this.supabase, auth.userId);
+    if (!player) apiError('Player not found', HttpStatus.NOT_FOUND);
+
+    const { error } = await this.supabase.db
+      .from('notifications')
+      .delete()
+      .eq('id', notificationId)
+      .eq('player_id', player.id);
+
+    if (error) apiError(error.message);
+    return { success: true };
+  }
+
+  /**
+   * Delete all read notifications for the player (used to "clear" the list).
+   * Actionable, unresponded partner_invite notifications are excluded —
+   * accept/decline deletes them immediately, so any that still carry their
+   * action data (tournamentId + inviterId) are pending a response and a
+   * "mark all read" pass shouldn't take away the player's ability to act on
+   * them. Older/legacy partner_invite rows without that data have no action
+   * left to take and are fair game for cleanup.
+   */
+  async deleteRead(auth: ClerkUser) {
+    const player = await getPlayerByClerkId(this.supabase, auth.userId);
+    if (!player) apiError('Player not found', HttpStatus.NOT_FOUND);
+
+    const { data: candidates, error: fetchError } = await this.supabase.db
+      .from('notifications')
+      .select('id, type, data')
+      .eq('player_id', player.id)
+      .eq('is_read', true);
+
+    if (fetchError) apiError(fetchError.message);
+
+    const idsToDelete = (candidates ?? [])
+      .filter((n) => {
+        if (n.type !== 'partner_invite') return true;
+        const data = (n.data ?? {}) as Record<string, unknown>;
+        return !(data.tournamentId && data.inviterId);
+      })
+      .map((n) => n.id as string);
+
+    if (idsToDelete.length === 0) return { success: true };
+
+    const { error } = await this.supabase.db
+      .from('notifications')
+      .delete()
+      .in('id', idsToDelete);
 
     if (error) apiError(error.message);
     return { success: true };

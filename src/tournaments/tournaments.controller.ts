@@ -70,6 +70,24 @@ export class TournamentsController {
     return this.tournaments.unregister(auth, id);
   }
 
+  @Post(':id/accept-invite')
+  acceptInvite(
+    @AuthUser() auth: ClerkUser,
+    @Param('id') id: string,
+    @Body() body: { inviterId: string },
+  ) {
+    return this.tournaments.acceptInvite(auth, id, body.inviterId);
+  }
+
+  @Post(':id/decline-invite')
+  declineInvite(
+    @AuthUser() auth: ClerkUser,
+    @Param('id') id: string,
+    @Body() body: { inviterId: string },
+  ) {
+    return this.tournaments.declineInvite(auth, id, body.inviterId);
+  }
+
   @Get(':id/registrations')
   @UseGuards(AdminGuard)
   listRegistrations(@Param('id') id: string) {

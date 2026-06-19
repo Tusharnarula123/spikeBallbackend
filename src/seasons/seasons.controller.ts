@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
   HttpStatus,
@@ -55,5 +56,12 @@ export class SeasonsController {
   @UseGuards(AdminGuard)
   activateSemester(@Param('semId') semId: string) {
     return this.semesters.activateSemester(semId);
+  }
+
+  /** Delete a season (and its semesters). Blocked if active or has recorded matches. */
+  @Delete(':id')
+  @UseGuards(AdminGuard)
+  remove(@Param('id') id: string) {
+    return this.semesters.deleteSeason(id);
   }
 }
