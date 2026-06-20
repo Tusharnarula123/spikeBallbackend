@@ -396,7 +396,11 @@ export class PlayersService {
 
     for (const reg of regs as Record<string, unknown>[]) {
       const tournament = reg.tournament as { status: string } | null;
-      if (tournament?.status === 'upcoming' || tournament?.status === 'registration_open') {
+      if (
+        tournament?.status === 'upcoming' ||
+        tournament?.status === 'registration_open' ||
+        tournament?.status === 'registration_closed'
+      ) {
         removableIds.push(reg.id as string);
         if (reg.team_id) teamIdsToDissolve.push(reg.team_id as string);
       }

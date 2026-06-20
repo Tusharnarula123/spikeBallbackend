@@ -9,6 +9,62 @@ import { MailService } from '../lib/mail.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { SupabaseService } from '../supabase/supabase.service';
 
+interface GameScore {
+  team1: number;
+  team2: number;
+}
+
+/**
+ * Computes the overall winner and score tally from raw per-game scores.
+ * A single entry is one game decided on points. A best-of-3 can be 3
+ * entries (full 3 games), or just 2 if one team swept both — the 3rd game
+ * is moot once a team already has 2 wins, so players don't have to play it.
+ * Two entries split 1-1 aren't enough on their own; that needs a 3rd game.
+ */
+function computeResultFromGames(games: GameScore[]): {
+  winningTeam: 1 | 2;
+  scoreTeam1: number;
+  scoreTeam2: number;
+} {
+  if (games.length < 1 || games.length > 3) {
+    apiError('games must contain 1, 2, or 3 entries');
+  }
+  for (const g of games) {
+    if (typeof g.team1 !== 'number' || g.team1 < 0 || typeof g.team2 !== 'number' || g.team2 < 0) {
+      apiError('Each game score must be a non-negative number');
+    }
+    if (g.team1 === g.team2) {
+      apiError('A game cannot end in a tie — one team must have a higher score');
+    }
+  }
+
+  if (games.length === 1) {
+    const [g] = games;
+    return {
+      winningTeam: g.team1 > g.team2 ? 1 : 2,
+      scoreTeam1: g.team1,
+      scoreTeam2: g.team2,
+    };
+  }
+
+  let gamesWon1 = 0;
+  let gamesWon2 = 0;
+  for (const g of games) {
+    if (g.team1 > g.team2) gamesWon1++;
+    else gamesWon2++;
+  }
+
+  if (games.length === 2 && gamesWon1 === gamesWon2) {
+    apiError('A 1-1 split needs a 3rd game to decide the winner');
+  }
+
+  return {
+    winningTeam: gamesWon1 > gamesWon2 ? 1 : 2,
+    scoreTeam1: gamesWon1,
+    scoreTeam2: gamesWon2,
+  };
+}
+
 @Injectable()
 export class MatchesService {
   constructor(
@@ -46,6 +102,7 @@ export class MatchesService {
     }
 
     const {
+      matchId,
       team1Player1Id,
       team1Player2Id,
       team2Player1Id,
@@ -53,67 +110,142 @@ export class MatchesService {
       winningTeam,
       scoreTeam1,
       scoreTeam2,
+      games,
       notes,
       tournamentId,
     } = body;
 
-    const playerIds = [
-      team1Player1Id,
-      team1Player2Id,
-      team2Player1Id,
-      team2Player2Id,
-    ] as string[];
+    // Either a per-game breakdown (1 game, or best-of-3) which determines the
+    // winner/score automatically, or the legacy manual winningTeam + optional
+    // overall score — kept for any caller that hasn't moved to `games` yet.
+    let finalWinningTeam: 1 | 2;
+    let finalScoreTeam1: number | undefined;
+    let finalScoreTeam2: number | undefined;
+    let gamesToStore: GameScore[] | null = null;
 
-    if (!playerIds.includes(player.id)) {
-      apiError('You must be one of the players in the match', HttpStatus.FORBIDDEN);
+    if (games !== undefined) {
+      if (!Array.isArray(games)) apiError('games must be an array');
+      gamesToStore = games as GameScore[];
+      const computed = computeResultFromGames(gamesToStore);
+      finalWinningTeam = computed.winningTeam;
+      finalScoreTeam1 = computed.scoreTeam1;
+      finalScoreTeam2 = computed.scoreTeam2;
+    } else {
+      if (![1, 2].includes(winningTeam as number)) {
+        apiError('winningTeam must be 1 or 2 (or provide a games breakdown)');
+      }
+      finalWinningTeam = winningTeam as 1 | 2;
+      finalScoreTeam1 = scoreTeam1 as number | undefined;
+      finalScoreTeam2 = scoreTeam2 as number | undefined;
     }
 
-    const semester = await getActiveSemester(this.supabase);
-    if (!semester) apiError('No active semester — an admin must activate a semester before matches can be submitted');
+    let data: Record<string, unknown> | null;
+    let playerIds: string[];
 
-    if (tournamentId) {
-      const { data: tournament } = await this.supabase.db
-        .from('tournaments')
-        .select('id, status')
-        .eq('id', tournamentId as string)
+    if (matchId) {
+      // Tournament matches (bracket / round-robin pool) are pre-scheduled by
+      // an admin generating the bracket — that row already carries
+      // bracket_round/bracket_slot/rr_pool/rr_round so the bracket & pool
+      // table can find it. Submitting a score for one of these must UPDATE
+      // that same row rather than insert a fresh, untracked one, otherwise
+      // the bracket/standings (which only read scheduled rows) never see it.
+      const { data: existing } = await this.supabase.db
+        .from('matches')
+        .select('*')
+        .eq('id', matchId as string)
         .single();
-      if (!tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
-      if (tournament.status !== 'in_progress') {
-        apiError('This tournament is not currently in progress');
+      if (!existing) apiError('Match not found', HttpStatus.NOT_FOUND);
+      if (existing.status !== 'pending') {
+        apiError('This match has already been decided — ask an admin to edit it');
       }
 
-      const { data: regs } = await this.supabase.db
-        .from('tournament_registrations')
-        .select('player_id')
-        .eq('tournament_id', tournamentId as string)
-        .in('player_id', playerIds);
-
-      if (!regs || regs.length < 4) {
-        apiError('All 4 players must be registered for this tournament');
+      playerIds = [
+        existing.team1_player1_id,
+        existing.team1_player2_id,
+        existing.team2_player1_id,
+        existing.team2_player2_id,
+      ];
+      if (!playerIds.includes(player.id)) {
+        apiError('You must be one of the players in the match', HttpStatus.FORBIDDEN);
       }
+
+      const { data: updated, error: updateError } = await this.supabase.db
+        .from('matches')
+        .update({
+          winning_team: finalWinningTeam,
+          score_team1:  finalScoreTeam1,
+          score_team2:  finalScoreTeam2,
+          games:        gamesToStore,
+          ...(notes !== undefined ? { notes } : {}),
+          submitted_by: player.id,
+          status:       'pending',
+        })
+        .eq('id', matchId as string)
+        .select()
+        .single();
+      if (updateError) apiError(updateError.message);
+      data = updated;
+    } else {
+      playerIds = [
+        team1Player1Id,
+        team1Player2Id,
+        team2Player1Id,
+        team2Player2Id,
+      ] as string[];
+
+      if (!playerIds.includes(player.id)) {
+        apiError('You must be one of the players in the match', HttpStatus.FORBIDDEN);
+      }
+
+      const semester = await getActiveSemester(this.supabase);
+      if (!semester) apiError('No active semester — an admin must activate a semester before matches can be submitted');
+
+      if (tournamentId) {
+        const { data: tournament } = await this.supabase.db
+          .from('tournaments')
+          .select('id, status')
+          .eq('id', tournamentId as string)
+          .single();
+        if (!tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
+        if (tournament.status !== 'in_progress') {
+          apiError('This tournament is not currently in progress');
+        }
+
+        const { data: regs } = await this.supabase.db
+          .from('tournament_registrations')
+          .select('player_id')
+          .eq('tournament_id', tournamentId as string)
+          .in('player_id', playerIds);
+
+        if (!regs || regs.length < 4) {
+          apiError('All 4 players must be registered for this tournament');
+        }
+      }
+
+      const { data: inserted, error } = await this.supabase.db
+        .from('matches')
+        .insert({
+          season_id:        semester!.season_id,
+          semester_id:      semester!.id,
+          team1_player1_id: team1Player1Id,
+          team1_player2_id: team1Player2Id,
+          team2_player1_id: team2Player1Id,
+          team2_player2_id: team2Player2Id,
+          winning_team:     finalWinningTeam,
+          score_team1:      finalScoreTeam1,
+          score_team2:      finalScoreTeam2,
+          games:            gamesToStore,
+          notes,
+          submitted_by:     player.id,
+          status:           'pending',
+          tournament_id:    tournamentId ?? null,
+        })
+        .select()
+        .single();
+
+      if (error) apiError(error.message);
+      data = inserted;
     }
-
-    const { data, error } = await this.supabase.db
-      .from('matches')
-      .insert({
-        season_id:        semester.season_id,
-        semester_id:      semester.id,
-        team1_player1_id: team1Player1Id,
-        team1_player2_id: team1Player2Id,
-        team2_player1_id: team2Player1Id,
-        team2_player2_id: team2Player2Id,
-        winning_team:     winningTeam,
-        score_team1:      scoreTeam1,
-        score_team2:      scoreTeam2,
-        notes,
-        submitted_by:     player.id,
-        status:           'pending',
-        tournament_id:    tournamentId ?? null,
-      })
-      .select()
-      .single();
-
-    if (error) apiError(error.message);
 
     // Notify all 4 players that a score has been submitted for their approval
     const { data: playerRows } = await this.supabase.db
@@ -272,6 +404,10 @@ export class MatchesService {
         tournament:tournaments ( id, name, is_casual, affects_elo )
       `)
       .eq('status', 'pending')
+      // Tournament schedules pre-create every match before it's played
+      // (status 'pending', no winner yet) — only show ones a player has
+      // actually submitted a score for.
+      .not('winning_team', 'is', null)
       .order('submitted_at', { ascending: true });
 
     if (error) apiError(error.message);
@@ -354,6 +490,8 @@ export class MatchesService {
           .eq('id', matchId)
           .select()
           .single();
+
+        await this.advanceBracketWinner({ ...match, ...approved }, admin?.id ?? null);
 
         return { match: approved, deltas: null, newElos: null };
       }
@@ -481,7 +619,85 @@ export class MatchesService {
       }),
     ]);
 
+    await this.advanceBracketWinner({ ...match, ...approved }, admin?.id ?? null);
+
     return { match: approved, deltas, newElos };
+  }
+
+  /**
+   * Single-elimination brackets only ever get their Round 1 matches created
+   * up front — nothing else generates Round 2+. Call this right after a
+   * bracket match is approved: once both matches feeding a slot in the next
+   * round are approved, create that next-round match with the two winners.
+   * If this round only had one match, it was the final — mark the
+   * tournament completed instead of trying to advance further.
+   */
+  private async advanceBracketWinner(
+    match: Record<string, any>,
+    adminId: string | null,
+  ) {
+    if (!match.tournament_id || match.bracket_round === null || match.bracket_round === undefined) {
+      return;
+    }
+
+    const { data: siblings } = await this.supabase.db
+      .from('matches')
+      .select('id, status, winning_team, bracket_slot, team1_player1_id, team1_player2_id, team2_player1_id, team2_player2_id')
+      .eq('tournament_id', match.tournament_id)
+      .eq('bracket_round', match.bracket_round);
+
+    if ((siblings?.length ?? 0) <= 1) {
+      // Only one match in this round — it was the final.
+      await this.supabase.db
+        .from('tournaments')
+        .update({ status: 'completed' })
+        .eq('id', match.tournament_id)
+        .eq('status', 'in_progress');
+      return;
+    }
+
+    const partnerSlot = match.bracket_slot % 2 === 0 ? match.bracket_slot + 1 : match.bracket_slot - 1;
+    const partner = siblings!.find((s) => s.bracket_slot === partnerSlot);
+    // Partner hasn't been approved yet (or doesn't exist — a bye) — wait;
+    // the partner's own approval will trigger this same check again.
+    if (!partner || partner.status !== 'approved' || partner.winning_team == null) return;
+
+    const nextRound = match.bracket_round + 1;
+    const nextSlot = Math.floor(match.bracket_slot / 2);
+
+    // Guard against double-creating the next match (e.g. a re-triggered check).
+    const { count: existing } = await this.supabase.db
+      .from('matches')
+      .select('id', { count: 'exact', head: true })
+      .eq('tournament_id', match.tournament_id)
+      .eq('bracket_round', nextRound)
+      .eq('bracket_slot', nextSlot);
+    if ((existing ?? 0) > 0) return;
+
+    const myP1 = match.winning_team === 1 ? match.team1_player1_id : match.team2_player1_id;
+    const myP2 = match.winning_team === 1 ? match.team1_player2_id : match.team2_player2_id;
+    const partnerP1 = partner.winning_team === 1 ? partner.team1_player1_id : partner.team2_player1_id;
+    const partnerP2 = partner.winning_team === 1 ? partner.team1_player2_id : partner.team2_player2_id;
+
+    // Keep the lower slot's winner as "team 1" so bracket ordering stays stable.
+    const lowerIsMine = match.bracket_slot < partner.bracket_slot;
+    const team1p1 = lowerIsMine ? myP1 : partnerP1;
+    const team1p2 = lowerIsMine ? myP2 : partnerP2;
+    const team2p1 = lowerIsMine ? partnerP1 : myP1;
+    const team2p2 = lowerIsMine ? partnerP2 : myP2;
+
+    await this.supabase.db.from('matches').insert({
+      season_id:        match.season_id,
+      tournament_id:    match.tournament_id,
+      team1_player1_id: team1p1,
+      team1_player2_id: team1p2,
+      team2_player1_id: team2p1,
+      team2_player2_id: team2p2,
+      status:           'pending',
+      bracket_round:    nextRound,
+      bracket_slot:     nextSlot,
+      submitted_by:     adminId ?? match.submitted_by,
+    });
   }
 
   async dispute(matchId: string, notes?: string) {

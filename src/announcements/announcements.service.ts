@@ -37,7 +37,7 @@ export class AnnouncementsService {
     const { data: tournaments, error } = await this.supabase.db
       .from('tournaments')
       .select('*')
-      .in('status', ['upcoming', 'registration_open', 'in_progress'])
+      .in('status', ['upcoming', 'registration_open', 'registration_closed', 'in_progress'])
       .order('start_date', { ascending: true });
 
     // tournaments table lives in database/tournaments_schema.sql — may not be migrated yet
@@ -56,6 +56,7 @@ export class AnnouncementsService {
     const tournamentAnnouncements: Announcement[] = (tournaments ?? []).map((t) => {
       let title: string;
       if (t.status === 'registration_open') title = `🏆 ${t.name} — Registration Open`;
+      else if (t.status === 'registration_closed') title = `🔒 ${t.name} — Registration Closed`;
       else if (t.status === 'in_progress') title = `🔥 ${t.name} — Live Now`;
       else title = `📅 Upcoming: ${t.name}`;
 

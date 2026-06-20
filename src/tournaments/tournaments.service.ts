@@ -14,6 +14,42 @@ interface Registration {
   team_name: string | null;
 }
 
+/**
+ * Standard round-robin "circle method": arranges `n` items into rounds where
+ * every item plays every other item exactly once, and within a single round
+ * no item appears twice. If `n` is odd, one item sits out (bye) each round.
+ *
+ * Returns rounds[roundIndex] = array of [itemA, itemB] pairs for that round.
+ */
+function buildRoundRobinRounds<T>(items: T[]): [T, T][][] {
+  if (items.length < 2) return [];
+
+  const hasBye = items.length % 2 === 1;
+  const arr: (T | null)[] = hasBye ? [...items, null] : [...items];
+  const size = arr.length;
+  const numRounds = size - 1;
+
+  const rounds: [T, T][][] = [];
+  let current = arr;
+  for (let r = 0; r < numRounds; r++) {
+    const roundPairs: [T, T][] = [];
+    for (let i = 0; i < size / 2; i++) {
+      const a = current[i];
+      const b = current[size - 1 - i];
+      if (a !== null && b !== null) roundPairs.push([a, b]);
+    }
+    rounds.push(roundPairs);
+
+    // Rotate: keep current[0] fixed, move the last element to sit right
+    // after it, shifting everything else down by one.
+    const fixed = current[0];
+    const rest = current.slice(1);
+    const lastEl = rest.pop()!;
+    current = [fixed, lastEl, ...rest];
+  }
+  return rounds;
+}
+
 @Injectable()
 export class TournamentsService {
   constructor(
@@ -153,7 +189,7 @@ export class TournamentsService {
     }
     if (
       update.status &&
-      !['upcoming', 'registration_open', 'in_progress', 'completed', 'cancelled'].includes(
+      !['upcoming', 'registration_open', 'registration_closed', 'in_progress', 'completed', 'cancelled'].includes(
         update.status as string,
       )
     ) {
@@ -546,7 +582,7 @@ export class TournamentsService {
     const { data: matches, error: mErr } = await this.supabase.db
       .from('matches')
       .select(`
-        id, bracket_round, bracket_slot, rr_pool, status,
+        id, bracket_round, bracket_slot, rr_pool, rr_round, status,
         winning_team, score_team1, score_team2,
         team1_player1_id, team1_player2_id, team2_player1_id, team2_player2_id,
         team1_player1:players!team1_player1_id ( id, first_name, last_name ),
@@ -561,13 +597,60 @@ export class TournamentsService {
 
     if (mErr) apiError(mErr.message);
 
+    // Resolve each match's team display name once, for both bracket and
+    // round-robin tournaments: the name players gave at registration if
+    // set, otherwise "First1 & First2".
+    type TeamRow = {
+      id: string;
+      player1_id: string;
+      player2_id: string;
+      team_name: string | null;
+      player1: { id: string; first_name: string; last_name: string };
+      player2: { id: string; first_name: string; last_name: string };
+    };
+    const { data: teams } = await this.supabase.db
+      .from('tournament_teams')
+      .select(`
+        id, player1_id, player2_id, team_name,
+        player1:players!player1_id ( id, first_name, last_name ),
+        player2:players!player2_id ( id, first_name, last_name )
+      `)
+      .eq('tournament_id', tournamentId);
+
+    const teamsByKey = new Map<string, TeamRow>();
+    for (const t of (teams ?? []) as unknown as TeamRow[]) {
+      teamsByKey.set(`${t.player1_id}:${t.player2_id}`, t);
+      teamsByKey.set(`${t.player2_id}:${t.player1_id}`, t);
+    }
+
+    const teamDisplayName = (
+      p1Id: string, p1First: string, p2Id: string, p2First: string,
+    ) => teamsByKey.get(`${p1Id}:${p2Id}`)?.team_name || `${p1First} & ${p2First}`;
+
+    for (const m of (matches ?? []) as Record<string, unknown>[]) {
+      const t1p1 = m.team1_player1 as { first_name: string } | null;
+      const t1p2 = m.team1_player2 as { first_name: string } | null;
+      const t2p1 = m.team2_player1 as { first_name: string } | null;
+      const t2p2 = m.team2_player2 as { first_name: string } | null;
+
+      m.team1_name = t1p1 && t1p2
+        ? teamDisplayName(m.team1_player1_id as string, t1p1.first_name, m.team1_player2_id as string, t1p2.first_name)
+        : 'Team 1';
+      m.team2_name = t2p1 && t2p2
+        ? teamDisplayName(m.team2_player1_id as string, t2p1.first_name, m.team2_player2_id as string, t2p2.first_name)
+        : 'Team 2';
+    }
+
     // ── Round Robin ────────────────────────────────────────────────────────────
     if ((tournament as Record<string, unknown>).tournament_type === 'round_robin') {
       const poolMatchMap = new Map<number, unknown[]>();
-      const finalsMatches: unknown[] = [];
+      const finalsPoolMatches: unknown[] = []; // rr_pool === -1 → "finals pool" (3+ original pools)
+      const finalsMatches: unknown[] = [];     // single bracket-style final (1 or 2 original pools)
 
       for (const m of (matches ?? []) as Record<string, unknown>[]) {
-        if (m.rr_pool !== null && m.rr_pool !== undefined) {
+        if (m.rr_pool === -1) {
+          finalsPoolMatches.push(m);
+        } else if (m.rr_pool !== null && m.rr_pool !== undefined) {
           const p = m.rr_pool as number;
           if (!poolMatchMap.has(p)) poolMatchMap.set(p, []);
           poolMatchMap.get(p)!.push(m);
@@ -576,36 +659,14 @@ export class TournamentsService {
         }
       }
 
-      // Fetch teams for standings computation
-      type TeamRow = {
-        id: string;
-        player1_id: string;
-        player2_id: string;
-        player1: { id: string; first_name: string; last_name: string };
-        player2: { id: string; first_name: string; last_name: string };
-      };
-      const { data: teams } = await this.supabase.db
-        .from('tournament_teams')
-        .select(`
-          id, player1_id, player2_id,
-          player1:players!player1_id ( id, first_name, last_name ),
-          player2:players!player2_id ( id, first_name, last_name )
-        `)
-        .eq('tournament_id', tournamentId);
-
-      const teamsByKey = new Map<string, TeamRow>();
-      for (const t of (teams ?? []) as unknown as TeamRow[]) {
-        teamsByKey.set(`${t.player1_id}:${t.player2_id}`, t);
-        teamsByKey.set(`${t.player2_id}:${t.player1_id}`, t);
-      }
-
+      // (teams/teamsByKey already resolved above, shared with match display names)
       type Standing = { teamId: string; name: string; wins: number; losses: number; pool: number };
       const standingsByTeam = new Map<string, Standing>();
       const poolTeamIds     = new Map<number, Set<string>>();
 
       for (const m of (matches ?? []) as Record<string, unknown>[]) {
         if (m.rr_pool === null || m.rr_pool === undefined) continue;
-        const pool = m.rr_pool as number;
+        const pool = m.rr_pool as number; // -1 (finals pool) is a valid key here too
         const t1 = teamsByKey.get(`${m.team1_player1_id}:${m.team1_player2_id}`)
                 ?? teamsByKey.get(`${m.team1_player2_id}:${m.team1_player1_id}`);
         const t2 = teamsByKey.get(`${m.team2_player1_id}:${m.team2_player2_id}`)
@@ -616,7 +677,8 @@ export class TournamentsService {
           if (!standingsByTeam.has(team.id)) {
             standingsByTeam.set(team.id, {
               teamId: team.id,
-              name: `${(team.player1 as { first_name: string }).first_name} & ${(team.player2 as { first_name: string }).first_name}`,
+              name: team.team_name
+                || `${(team.player1 as { first_name: string }).first_name} & ${(team.player2 as { first_name: string }).first_name}`,
               wins: 0, losses: 0, pool,
             });
           }
@@ -624,7 +686,10 @@ export class TournamentsService {
           poolTeamIds.get(pool)!.add(team.id);
         }
 
-        if (m.status === 'approved' && m.winning_team) {
+        // Count any match with a winner already on it (pending or approved)
+        // so the table reflects what players just submitted right away,
+        // without waiting on admin approval. Disputed/cancelled don't count.
+        if ((m.status === 'approved' || m.status === 'pending') && m.winning_team) {
           const winner = m.winning_team === 1 ? t1 : t2;
           const loser  = m.winning_team === 1 ? t2 : t1;
           if (winner && standingsByTeam.has(winner.id)) standingsByTeam.get(winner.id)!.wins++;
@@ -632,17 +697,48 @@ export class TournamentsService {
         }
       }
 
-      const poolCount = poolMatchMap.size;
-      const pools = Array.from({ length: poolCount }, (_, i) => ({
-        pool: i,
-        label: String.fromCharCode(65 + i),
-        matches: poolMatchMap.get(i) ?? [],
-        standings: Array.from(poolTeamIds.get(i) ?? [])
-          .map(id => standingsByTeam.get(id)!)
-          .filter(Boolean)
-          .sort((a, b) => b.wins - a.wins || a.losses - b.losses),
-      }));
+      // Shared shape-builder for a pool's view: groups its matches by
+      // rr_round ("Round 1", "Round 2", ...) and attaches its standings.
+      // Used for regular numbered pools (0..N-1) and, when 3+ original
+      // pools require a finals pool, the special pool key -1.
+      const buildPoolEntry = (poolIdx: number, label: string, poolMatches: unknown[]) => {
+        const roundMap = new Map<number, unknown[]>();
+        for (const m of poolMatches as Record<string, unknown>[]) {
+          // Matches generated before the rr_round column existed have it as
+          // null — bucket those under 0 ("Unscheduled") rather than dropping.
+          const round = (m.rr_round as number | null) ?? 0;
+          if (!roundMap.has(round)) roundMap.set(round, []);
+          roundMap.get(round)!.push(m);
+        }
+        const rounds = Array.from(roundMap.entries())
+          .sort(([a], [b]) => a - b)
+          .map(([round, roundMatches]) => ({ round, matches: roundMatches }));
 
+        return {
+          pool: poolIdx,
+          label,
+          matches: poolMatches,
+          rounds,
+          standings: Array.from(poolTeamIds.get(poolIdx) ?? [])
+            .map(id => standingsByTeam.get(id)!)
+            .filter(Boolean)
+            .sort((a, b) => b.wins - a.wins || a.losses - b.losses),
+        };
+      };
+
+      const poolCount = poolMatchMap.size;
+      const pools = Array.from({ length: poolCount }, (_, i) =>
+        buildPoolEntry(i, String.fromCharCode(65 + i), poolMatchMap.get(i) ?? []),
+      );
+
+      // 3+ original pools → top team from each plays a round-robin "finals
+      // pool" (rr_pool = -1). Show it like any other pool, just labeled
+      // "Finals" instead of a letter.
+      if (finalsPoolMatches.length > 0) {
+        pools.push(buildPoolEntry(-1, 'Finals', finalsPoolMatches));
+      }
+
+      // 1 or 2 original pools → a single bracket-style final match instead.
       const rounds = finalsMatches.length > 0
         ? [{ round: 99, label: 'Finals', matches: finalsMatches }]
         : [];
@@ -666,7 +762,10 @@ export class TournamentsService {
     return { tournament, rounds, pools: [] };
   }
 
-  async generateRoundRobin(tournamentId: string) {
+  async generateRoundRobin(auth: ClerkUser, tournamentId: string) {
+    const admin = await getPlayerByClerkId(this.supabase, auth.userId);
+    if (!admin) apiError('Admin player record not found', HttpStatus.NOT_FOUND);
+
     const { data: tournament } = await this.supabase.db
       .from('tournaments')
       .select('id, name, status, season_id, tournament_type')
@@ -711,11 +810,15 @@ export class TournamentsService {
       [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
 
-    // Compute number of pools: p = round(n/5), then clamp so each pool has 4–7 teams
+    // Compute number of pools: 7 or fewer teams stay in a single pool. Once
+    // there are more than 7, split into the fewest pools that keep every
+    // pool at 5 teams or fewer (so >7 → 2 pools, >14 → 3 pools, >21 → 4
+    // pools, and so on), distributed as evenly as possible — each pool ends
+    // up with 4 or 5 teams. (A handful of awkward totals, e.g. 11, can't be
+    // split into parts that are all exactly 4 or 5 — those fall back to one
+    // smaller pool rather than letting any pool exceed 5.)
     const n = shuffled.length;
-    let p = Math.round(n / 5) || 1;
-    while (p > 1 && n / p < 4) p--;
-    while (n / p > 7) p++;
+    const p = n <= 7 ? 1 : Math.ceil(n / 5);
 
     // Distribute teams as evenly as possible across p pools
     const base = Math.floor(n / p);
@@ -728,24 +831,29 @@ export class TournamentsService {
       cursor += size;
     }
 
-    // Generate all N*(N-1)/2 match pairs per pool
+    // Generate every pair per pool, organized into rounds via the circle
+    // method so each round has every team playing at most once (rather than
+    // one flat list of all N*(N-1)/2 pairs in arbitrary order).
     const matchInserts: Record<string, unknown>[] = [];
     for (let poolIdx = 0; poolIdx < pools.length; poolIdx++) {
       const pool = pools[poolIdx];
-      for (let i = 0; i < pool.length; i++) {
-        for (let j = i + 1; j < pool.length; j++) {
+      const rounds = buildRoundRobinRounds(pool);
+      rounds.forEach((roundPairs, roundIdx) => {
+        for (const [teamA, teamB] of roundPairs) {
           matchInserts.push({
             season_id:        seasonId,
             tournament_id:    tournamentId,
-            team1_player1_id: pool[i].player1_id,
-            team1_player2_id: pool[i].player2_id,
-            team2_player1_id: pool[j].player1_id,
-            team2_player2_id: pool[j].player2_id,
+            team1_player1_id: teamA.player1_id,
+            team1_player2_id: teamA.player2_id,
+            team2_player1_id: teamB.player1_id,
+            team2_player2_id: teamB.player2_id,
             status:           'pending',
             rr_pool:          poolIdx,
+            rr_round:         roundIdx + 1,
+            submitted_by:     admin!.id,
           });
         }
-      }
+      });
     }
 
     const { data: created, error: insertError } = await this.supabase.db
@@ -757,6 +865,7 @@ export class TournamentsService {
     // Advance tournament status
     if (
       (tournament as Record<string, unknown>).status === 'registration_open' ||
+      (tournament as Record<string, unknown>).status === 'registration_closed' ||
       (tournament as Record<string, unknown>).status === 'upcoming'
     ) {
       await this.supabase.db
@@ -777,7 +886,10 @@ export class TournamentsService {
     };
   }
 
-  async generateRRFinals(tournamentId: string) {
+  async generateRRFinals(auth: ClerkUser, tournamentId: string) {
+    const admin = await getPlayerByClerkId(this.supabase, auth.userId);
+    if (!admin) apiError('Admin player record not found', HttpStatus.NOT_FOUND);
+
     const { data: tournament } = await this.supabase.db
       .from('tournaments')
       .select('id, name, season_id, tournament_type')
@@ -788,26 +900,34 @@ export class TournamentsService {
       apiError('Not a Round Robin tournament');
     }
 
-    // Check finals doesn't already exist
-    const { count: existingFinals } = await this.supabase.db
+    // Check finals doesn't already exist — either a single bracket-style
+    // final (1 or 2 pools) or a round-robin finals pool (rr_pool = -1, 3+ pools).
+    const { count: existingSingleFinal } = await this.supabase.db
       .from('matches')
       .select('id', { count: 'exact', head: true })
       .eq('tournament_id', tournamentId)
       .is('rr_pool', null)
       .not('bracket_round', 'is', null);
-    if ((existingFinals ?? 0) > 0) apiError('Finals match already exists');
+    const { count: existingFinalsPool } = await this.supabase.db
+      .from('matches')
+      .select('id', { count: 'exact', head: true })
+      .eq('tournament_id', tournamentId)
+      .eq('rr_pool', -1);
+    if ((existingSingleFinal ?? 0) > 0 || (existingFinalsPool ?? 0) > 0) {
+      apiError('Finals already exist');
+    }
 
-    // Get pool matches (all statuses) to compute standings
+    // Get pool matches (all statuses, regular pools only) to compute standings
     const { data: poolMatches } = await this.supabase.db
       .from('matches')
       .select('id, rr_pool, status, winning_team, team1_player1_id, team1_player2_id, team2_player1_id, team2_player2_id')
       .eq('tournament_id', tournamentId)
-      .not('rr_pool', 'is', null);
+      .not('rr_pool', 'is', null)
+      .gte('rr_pool', 0);
 
     if (!poolMatches || poolMatches.length === 0) apiError('No pool matches found — generate schedule first');
 
     const poolIndices = [...new Set(poolMatches.map(m => m.rr_pool as number))].sort((a, b) => a - b);
-    if (poolIndices.length < 2) apiError('Single-pool tournament — pool winner wins without a finals match');
 
     // Get tournament teams
     const { data: teams } = await this.supabase.db
@@ -815,7 +935,8 @@ export class TournamentsService {
       .select('id, player1_id, player2_id')
       .eq('tournament_id', tournamentId);
 
-    const teamsByKey = new Map<string, { id: string; player1_id: string; player2_id: string }>();
+    type TeamRef = { id: string; player1_id: string; player2_id: string };
+    const teamsByKey = new Map<string, TeamRef>();
     for (const t of teams ?? []) {
       teamsByKey.set(`${t.player1_id}:${t.player2_id}`, t);
       teamsByKey.set(`${t.player2_id}:${t.player1_id}`, t);
@@ -844,20 +965,13 @@ export class TournamentsService {
       }
     }
 
-    // Find leader per pool
-    const poolLeaders: { id: string; player1_id: string; player2_id: string }[] = [];
-    for (const poolIdx of poolIndices) {
-      let leaderId: string | null = null;
-      let maxWins = -1;
-      for (const [teamId, wins] of teamWins.entries()) {
-        if (teamPoolMap.get(teamId) !== poolIdx) continue;
-        if (wins > maxWins) { maxWins = wins; leaderId = teamId; }
-      }
-      if (!leaderId) apiError(`Could not determine pool ${String.fromCharCode(65 + poolIdx)} leader`);
-      const leader = teams?.find(t => t.id === leaderId);
-      if (!leader) apiError('Team data missing');
-      poolLeaders.push(leader!);
-    }
+    // Ranks teams within one pool, best record first.
+    const rankPool = (poolIdx: number): TeamRef[] =>
+      [...teamWins.entries()]
+        .filter(([teamId]) => teamPoolMap.get(teamId) === poolIdx)
+        .sort((a, b) => b[1] - a[1])
+        .map(([teamId]) => teams?.find(t => t.id === teamId))
+        .filter((t): t is TeamRef => !!t);
 
     // Resolve season_id
     let seasonId = (tournament as Record<string, unknown>).season_id as string | null;
@@ -867,31 +981,106 @@ export class TournamentsService {
       if (activeSeason) seasonId = activeSeason.id;
     }
 
-    const { data: finalsMatch, error: finalsError } = await this.supabase.db
+    // ── Single pool: top 2 teams in that pool play one final match ────────
+    if (poolIndices.length === 1) {
+      const ranked = rankPool(poolIndices[0]);
+      if (ranked.length < 2) apiError('Need at least 2 teams in the pool to create a final');
+      const [first, second] = ranked;
+
+      const { data: finalsMatch, error: finalsError } = await this.supabase.db
+        .from('matches')
+        .insert({
+          season_id:        seasonId,
+          tournament_id:    tournamentId,
+          team1_player1_id: first.player1_id,
+          team1_player2_id: first.player2_id,
+          team2_player1_id: second.player1_id,
+          team2_player2_id: second.player2_id,
+          status:           'pending',
+          bracket_round:    1,
+          bracket_slot:     0,
+          submitted_by:     admin!.id,
+        })
+        .select()
+        .single();
+      if (finalsError) apiError(finalsError.message);
+
+      return { finalsMatch, message: 'Final created: #1 vs #2 from the pool!' };
+    }
+
+    // ── Two pools: each pool's top team plays a single final match ────────
+    if (poolIndices.length === 2) {
+      const leaders = poolIndices.map((idx) => {
+        const ranked = rankPool(idx);
+        if (ranked.length === 0) apiError(`Could not determine pool ${String.fromCharCode(65 + idx)} leader`);
+        return ranked[0];
+      });
+
+      const { data: finalsMatch, error: finalsError } = await this.supabase.db
+        .from('matches')
+        .insert({
+          season_id:        seasonId,
+          tournament_id:    tournamentId,
+          team1_player1_id: leaders[0].player1_id,
+          team1_player2_id: leaders[0].player2_id,
+          team2_player1_id: leaders[1].player1_id,
+          team2_player2_id: leaders[1].player2_id,
+          status:           'pending',
+          bracket_round:    1,
+          bracket_slot:     0,
+          submitted_by:     admin!.id,
+        })
+        .select()
+        .single();
+      if (finalsError) apiError(finalsError.message);
+
+      return { finalsMatch, message: 'Finals match created: Pool A leader vs Pool B leader!' };
+    }
+
+    // ── Three or more pools: top team from each plays a round-robin
+    // "finals pool" (rr_pool = -1) — best overall record wins ─────────────
+    const finalists = poolIndices.map((idx) => {
+      const ranked = rankPool(idx);
+      if (ranked.length === 0) apiError(`Could not determine pool ${String.fromCharCode(65 + idx)} leader`);
+      return ranked[0];
+    });
+
+    const finalsRounds = buildRoundRobinRounds(finalists);
+    const matchInserts: Record<string, unknown>[] = [];
+    finalsRounds.forEach((roundPairs, roundIdx) => {
+      for (const [teamA, teamB] of roundPairs) {
+        matchInserts.push({
+          season_id:        seasonId,
+          tournament_id:    tournamentId,
+          team1_player1_id: teamA.player1_id,
+          team1_player2_id: teamA.player2_id,
+          team2_player1_id: teamB.player1_id,
+          team2_player2_id: teamB.player2_id,
+          status:           'pending',
+          rr_pool:          -1,
+          rr_round:         roundIdx + 1,
+          submitted_by:     admin!.id,
+        });
+      }
+    });
+
+    const { data: created, error: insertError } = await this.supabase.db
       .from('matches')
-      .insert({
-        season_id:        seasonId,
-        tournament_id:    tournamentId,
-        team1_player1_id: poolLeaders[0].player1_id,
-        team1_player2_id: poolLeaders[0].player2_id,
-        team2_player1_id: poolLeaders[1].player1_id,
-        team2_player2_id: poolLeaders[1].player2_id,
-        status:           'pending',
-        bracket_round:    1,
-        bracket_slot:     0,
-      })
-      .select()
-      .single();
+      .insert(matchInserts)
+      .select('id');
+    if (insertError) apiError(insertError.message);
 
-    if (finalsError) apiError(finalsError.message);
-
+    const matchCount = created?.length ?? 0;
     return {
-      finalsMatch,
-      message: `Finals match created: Pool A leader vs Pool B leader!`,
+      matchesCreated: matchCount,
+      message: `Finals pool created: top team from each of the ${poolIndices.length} pools (${matchCount} match${matchCount === 1 ? '' : 'es'}) — best record wins!`,
     };
   }
 
-  async generateBracket(tournamentId: string) {
+  async generateBracket(auth: ClerkUser, tournamentId: string) {
+    const admin = await getPlayerByClerkId(this.supabase, auth.userId);
+    if (!admin) apiError('Admin player record not found', HttpStatus.NOT_FOUND);
+
     const { data: tournament } = await this.supabase.db
       .from('tournaments')
       .select('id, name, status, season_id')
@@ -953,6 +1142,7 @@ export class TournamentsService {
         status:           'pending',
         bracket_round:    1,
         bracket_slot:     i / 2,
+        submitted_by:     admin!.id,
       });
     }
 
@@ -966,7 +1156,11 @@ export class TournamentsService {
     if (insertError) apiError(insertError.message);
 
     // Advance tournament to in_progress if still in registration/upcoming
-    if (tournament.status === 'registration_open' || tournament.status === 'upcoming') {
+    if (
+      tournament.status === 'registration_open' ||
+      tournament.status === 'registration_closed' ||
+      tournament.status === 'upcoming'
+    ) {
       await this.supabase.db
         .from('tournaments')
         .update({ status: 'in_progress' })

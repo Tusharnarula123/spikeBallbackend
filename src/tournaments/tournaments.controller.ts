@@ -102,22 +102,22 @@ export class TournamentsController {
   @Post(':id/generate-bracket')
   @UseGuards(AdminGuard)
   @HttpCode(HttpStatus.CREATED)
-  generateBracket(@Param('id') id: string) {
-    return this.tournaments.generateBracket(id);
+  generateBracket(@AuthUser() auth: ClerkUser, @Param('id') id: string) {
+    return this.tournaments.generateBracket(auth, id);
   }
 
   @Post(':id/generate-round-robin')
   @UseGuards(AdminGuard)
   @HttpCode(HttpStatus.CREATED)
-  generateRoundRobin(@Param('id') id: string) {
-    return this.tournaments.generateRoundRobin(id);
+  generateRoundRobin(@AuthUser() auth: ClerkUser, @Param('id') id: string) {
+    return this.tournaments.generateRoundRobin(auth, id);
   }
 
   @Post(':id/generate-finals')
   @UseGuards(AdminGuard)
   @HttpCode(HttpStatus.CREATED)
-  generateRRFinals(@Param('id') id: string) {
-    return this.tournaments.generateRRFinals(id);
+  generateRRFinals(@AuthUser() auth: ClerkUser, @Param('id') id: string) {
+    return this.tournaments.generateRRFinals(auth, id);
   }
 
   @Post(':id/form-teams')
