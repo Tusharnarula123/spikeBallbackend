@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
   HttpStatus,
@@ -68,5 +69,11 @@ export class PlayersController {
   @UseGuards(AdminGuard)
   suspend(@Param('id', ParseUUIDPipe) id: string) {
     return this.players.suspend(id);
+  }
+
+  @Delete(':id/reject')
+  @UseGuards(AdminGuard)
+  reject(@Param('id', ParseUUIDPipe) id: string) {
+    return this.players.reject(id);
   }
 }

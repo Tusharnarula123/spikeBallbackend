@@ -360,6 +360,42 @@ export class PlayersService {
     return data;
   }
 
+  /**
+   * Rejecting a pending sign-up is not the same as suspending an active
+   * member — there's nothing worth keeping a record of, so this removes the
+   * account entirely instead of marking it 'suspended'. Only ever applies to
+   * still-pending players: someone who's already active/suspended has real
+   * history attached and must go through suspend() instead, which a brand
+   * new sign-up never has.
+   */
+  async reject(id: string) {
+    const { data: player } = await this.supabase.db
+      .from('players')
+      .select('id, status')
+      .eq('id', id)
+      .single();
+    if (!player) apiError('Player not found', HttpStatus.NOT_FOUND);
+    if (player.status !== 'pending') {
+      apiError('Only a pending sign-up can be rejected — suspend an existing member instead', HttpStatus.BAD_REQUEST);
+    }
+
+    // Clear the one non-cascading reference a brand-new sign-up could still
+    // be the target of: another pending player picking them as a preferred
+    // partner before either was approved.
+    await this.supabase.db
+      .from('tournament_registrations')
+      .update({ preferred_partner_id: null })
+      .eq('preferred_partner_id', id);
+
+    const { error } = await this.supabase.db
+      .from('players')
+      .delete()
+      .eq('id', id);
+    if (error) apiError(error.message, HttpStatus.INTERNAL_SERVER_ERROR);
+
+    return { success: true, id };
+  }
+
   async suspend(id: string) {
     const { data, error } = await this.supabase.db
       .from('players')
