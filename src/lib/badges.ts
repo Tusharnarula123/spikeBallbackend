@@ -72,7 +72,7 @@ export async function autoAwardBadges(
             break;
           }
           case 'placement_done':
-            earned = placementCounts[i] >= 10;
+            earned = placementCounts[i] >= 5;
             break;
         }
 

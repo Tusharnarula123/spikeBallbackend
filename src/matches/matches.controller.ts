@@ -38,7 +38,8 @@ export class MatchesController {
 
   @Get('me')
   getMyMatches(@AuthUser() auth: ClerkUser, @Query('seasonId') seasonId?: string) {
-    return this.matches.getMyMatches(auth, seasonId);
+    // Pass as seasonId (second arg) so service filters by season_id, not semester_id.
+    return this.matches.getMyMatches(auth, undefined, seasonId);
   }
 
   @Get('pending')

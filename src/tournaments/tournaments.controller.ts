@@ -113,11 +113,30 @@ export class TournamentsController {
     return this.tournaments.generateRoundRobin(auth, id);
   }
 
+  @Get(':id/rounds')
+  getRotatingRounds(@Param('id') id: string) {
+    return this.tournaments.getRotatingRounds(id);
+  }
+
+  @Post(':id/generate-round')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.CREATED)
+  generateRotatingRound(@AuthUser() auth: ClerkUser, @Param('id') id: string) {
+    return this.tournaments.generateRotatingRound(auth, id);
+  }
+
   @Post(':id/generate-finals')
   @UseGuards(AdminGuard)
   @HttpCode(HttpStatus.CREATED)
   generateRRFinals(@AuthUser() auth: ClerkUser, @Param('id') id: string) {
     return this.tournaments.generateRRFinals(auth, id);
+  }
+
+  @Post(':id/add-late-teams')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.CREATED)
+  addLateTeams(@AuthUser() auth: ClerkUser, @Param('id') id: string) {
+    return this.tournaments.addLateTeams(auth, id);
   }
 
   @Post(':id/form-teams')

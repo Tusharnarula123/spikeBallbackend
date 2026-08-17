@@ -4,7 +4,7 @@ import { apiError } from '../common/api-error';
 import { DEFAULT_ELO } from '../common/config';
 import { getActiveSemester, getPlayerByClerkId } from '../common/player.helpers';
 import { autoAwardBadges, recomputeSemesterRanks } from '../lib/badges';
-import { calculate2v2 } from '../lib/elo';
+import { calculateTeams } from '../lib/elo';
 import { MailService } from '../lib/mail.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { SupabaseService } from '../supabase/supabase.service';
@@ -159,12 +159,16 @@ export class MatchesService {
         apiError('This match has already been decided — ask an admin to edit it');
       }
 
+      // Includes the third slot so the extra player on an odd-numbered
+      // rotating team can submit the score and gets notified like everyone else.
       playerIds = [
         existing.team1_player1_id,
         existing.team1_player2_id,
+        existing.team1_player3_id,
         existing.team2_player1_id,
         existing.team2_player2_id,
-      ];
+        existing.team2_player3_id,
+      ].filter(Boolean);
       if (!playerIds.includes(player.id)) {
         apiError('You must be one of the players in the match', HttpStatus.FORBIDDEN);
       }
@@ -306,7 +310,7 @@ export class MatchesService {
 
     let query = this.supabase.db
       .from('matches')
-      .select('*')
+      .select('*, tournament:tournaments(affects_elo)')
       .or(
         `team1_player1_id.eq.${player.id},team1_player2_id.eq.${player.id},` +
           `team2_player1_id.eq.${player.id},team2_player2_id.eq.${player.id}`,
@@ -325,10 +329,12 @@ export class MatchesService {
 
     const ids = new Set<string>();
     for (const m of rows) {
-      ids.add(m.team1_player1_id);
-      ids.add(m.team1_player2_id);
-      ids.add(m.team2_player1_id);
-      ids.add(m.team2_player2_id);
+      for (const pid of [
+        m.team1_player1_id, m.team1_player2_id, m.team1_player3_id,
+        m.team2_player1_id, m.team2_player2_id, m.team2_player3_id,
+      ]) {
+        if (pid) ids.add(pid);
+      }
     }
 
     const { data: players } = await this.supabase.db
@@ -350,21 +356,16 @@ export class MatchesService {
     const eloMap = new Map((eloRows ?? []).map((e) => [e.match_id, e.elo_change]));
 
     return rows.map((m) => {
-      const onTeam1 =
-        m.team1_player1_id === player.id || m.team1_player2_id === player.id;
+      const team1 = [m.team1_player1_id, m.team1_player2_id, m.team1_player3_id].filter(Boolean);
+      const team2 = [m.team2_player1_id, m.team2_player2_id, m.team2_player3_id].filter(Boolean);
+
+      const onTeam1 = team1.includes(player.id);
       const myTeam = onTeam1 ? 1 : 2;
 
-      const partnerId = onTeam1
-        ? m.team1_player1_id === player.id
-          ? m.team1_player2_id
-          : m.team1_player1_id
-        : m.team2_player1_id === player.id
-          ? m.team2_player2_id
-          : m.team2_player1_id;
-
-      const opponentIds = onTeam1
-        ? [m.team2_player1_id, m.team2_player2_id]
-        : [m.team1_player1_id, m.team1_player2_id];
+      // Usually one teammate, but two on the odd-player-out team of a
+      // rotating session.
+      const partnerIds: string[] = (onTeam1 ? team1 : team2).filter((id) => id !== player.id);
+      const opponentIds: string[] = onTeam1 ? team2 : team1;
 
       const myScore = onTeam1 ? m.score_team1 : m.score_team2;
       const opponentScore = onTeam1 ? m.score_team2 : m.score_team1;
@@ -382,8 +383,13 @@ export class MatchesService {
             : null,
         myScore,
         opponentScore,
+        competitive: m.tournament ? m.tournament.affects_elo !== false : true,
         eloChange: eloMap.get(m.id) ?? null,
-        partner: { id: partnerId, name: nameMap.get(partnerId) ?? 'Unknown' },
+        partners: partnerIds.map((id) => ({ id, name: nameMap.get(id) ?? 'Unknown' })),
+        // Kept for existing callers: the first teammate, or null if somehow alone.
+        partner: partnerIds[0]
+          ? { id: partnerIds[0], name: nameMap.get(partnerIds[0]) ?? 'Unknown' }
+          : null,
         opponents: opponentIds.map((id) => ({
           id,
           name: nameMap.get(id) ?? 'Unknown',
@@ -497,12 +503,15 @@ export class MatchesService {
       }
     }
 
-    const playerIds: string[] = [
-      match.team1_player1_id,
-      match.team1_player2_id,
-      match.team2_player1_id,
-      match.team2_player2_id,
-    ];
+    // Rotating sessions with an odd player count produce one 3-player team, so
+    // team sizes are 2 or 3 and variable from here down.
+    const team1Ids: string[] = [
+      match.team1_player1_id, match.team1_player2_id, match.team1_player3_id,
+    ].filter(Boolean);
+    const team2Ids: string[] = [
+      match.team2_player1_id, match.team2_player2_id, match.team2_player3_id,
+    ].filter(Boolean);
+    const playerIds: string[] = [...team1Ids, ...team2Ids];
 
     const { data: semesterRow } = await this.supabase.db
       .from('semesters')
@@ -534,16 +543,11 @@ export class MatchesService {
 
     const elosBefore = playerIds.map((pid) => statMap[pid].elo);
 
-    const { deltas, newElos } = calculate2v2(
-      [elosBefore[0], elosBefore[1]],
-      [elosBefore[2], elosBefore[3]],
+    const { deltas, newElos } = calculateTeams(
+      team1Ids.map((pid) => statMap[pid].elo),
+      team2Ids.map((pid) => statMap[pid].elo),
       match.winning_team,
-      [
-        statMap[playerIds[0]].placement,
-        statMap[playerIds[1]].placement,
-        statMap[playerIds[2]].placement,
-        statMap[playerIds[3]].placement,
-      ],
+      playerIds.map((pid) => statMap[pid].placement),
     );
 
     const { error: historyError } = await this.supabase.db.from('elo_history').insert(
@@ -562,12 +566,13 @@ export class MatchesService {
     }
 
     const newPlacements = playerIds.map((pid) =>
-      Math.min(statMap[pid].placement + 1, 10),
+      Math.min(statMap[pid].placement + 1, 5),
     );
 
     await Promise.all(
       playerIds.flatMap((pid, i) => {
-        const won = (i < 2 && match.winning_team === 1) || (i >= 2 && match.winning_team === 2);
+        const onTeam1 = i < team1Ids.length;
+        const won = onTeam1 ? match.winning_team === 1 : match.winning_team === 2;
         const newPeakSemester = Math.max(newElos[i], statMap[pid].peak);
         return [
           // Semester-level stats (source of truth for live ELO)
@@ -583,7 +588,9 @@ export class MatchesService {
               placement_matches_played: newPlacements[i],
             },
             { onConflict: 'player_id,semester_id' },
-          ),
+          ).then(({ error }) => {
+            if (error) throw new Error(`player_semester_stats upsert failed for ${pid}: ${error.message}`);
+          }),
           // Season aggregate (peak ELO across all semesters + total W/L)
           this.supabase.db.rpc('upsert_player_season_aggregate', {
             p_player_id:  pid,
@@ -591,8 +598,14 @@ export class MatchesService {
             p_new_elo:    newElos[i],
             p_won:        won,
           }),
-          // Cache current ELO on the player row for fast leaderboard queries
-          this.supabase.db.from('players').update({ current_elo: newElos[i] }).eq('id', pid),
+          // Cache current ELO + current-semester placement count on the player row
+          // (placement_matches_played resets to 0 each semester via the semester activation flow)
+          this.supabase.db.from('players').update({
+            current_elo: newElos[i],
+            placement_matches_played: newPlacements[i],
+          }).eq('id', pid).then(({ error }) => {
+            if (error) throw new Error(`players ELO sync failed for ${pid}: ${error.message}`);
+          }),
         ];
       }),
     );
@@ -688,6 +701,7 @@ export class MatchesService {
 
     await this.supabase.db.from('matches').insert({
       season_id:        match.season_id,
+      semester_id:      match.semester_id ?? (await getActiveSemester(this.supabase))?.id ?? null,
       tournament_id:    match.tournament_id,
       team1_player1_id: team1p1,
       team1_player2_id: team1p2,

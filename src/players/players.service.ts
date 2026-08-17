@@ -6,6 +6,8 @@ import { ClerkUser } from '../auth/auth.types';
 import { apiError } from '../common/api-error';
 import { DEFAULT_ELO } from '../common/config';
 import { getPlayerByClerkId } from '../common/player.helpers';
+import { MailService } from '../lib/mail.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { SupabaseService } from '../supabase/supabase.service';
 
 // player_badges has two FKs to players (player_id + awarded_by) — must disambiguate.
@@ -19,12 +21,40 @@ export class PlayersService {
     private readonly supabase: SupabaseService,
     private readonly clerk: ClerkService,
     private readonly config: ConfigService,
+    private readonly mail: MailService,
+    private readonly notifs: NotificationsService,
   ) {
     cloudinary.config({
       cloud_name: this.config.get<string>('CLOUDINARY_CLOUD_NAME'),
       api_key:    this.config.get<string>('CLOUDINARY_API_KEY'),
       api_secret: this.config.get<string>('CLOUDINARY_API_SECRET'),
     });
+  }
+
+  /** Public: search active players by name. Returns minimal public-safe fields. */
+  async searchPublic(q?: string) {
+    let query = this.supabase.db
+      .from('players')
+      .select('id, first_name, last_name, avatar_url, current_elo, placement_matches_played')
+      .eq('status', 'active')
+      .order('first_name', { ascending: true })
+      .limit(10);
+    if (q) query = query.or(`first_name.ilike.%${q}%,last_name.ilike.%${q}%`);
+    const { data, error } = await query;
+    if (error) apiError(error.message);
+    return data;
+  }
+
+  /** Admin-only: return every player regardless of status. */
+  async listAll(search?: string) {
+    let q = this.supabase.db
+      .from('players')
+      .select('id, first_name, last_name, email, age, gender, university, current_elo, placement_matches_played, status, created_at, avatar_url')
+      .order('first_name', { ascending: true });
+    if (search) q = q.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%`);
+    const { data, error } = await q;
+    if (error) apiError(error.message);
+    return data;
   }
 
   async list(auth: ClerkUser, query: { status?: string; excludeSelf?: string; search?: string }) {
@@ -38,7 +68,7 @@ export class PlayersService {
 
     let q = this.supabase.db
       .from('players')
-      .select('id, first_name, last_name, email, age, gender, university, current_elo, status, created_at, avatar_url')
+      .select('id, first_name, last_name, email, age, gender, university, current_elo, placement_matches_played, status, created_at, avatar_url')
       .order('first_name', { ascending: true });
 
     if (status !== 'all') q = q.eq('status', status);
@@ -124,6 +154,28 @@ export class PlayersService {
 
     if (error) apiError(error.message, HttpStatus.INTERNAL_SERVER_ERROR);
     if (!data) apiError('Player not found', HttpStatus.NOT_FOUND);
+
+    // Override placement_matches_played from the active semester's stats.
+    // The players table value can be stale (0) for players whose matches
+    // were approved before the sync fix was deployed.
+    const { data: activeSem } = await this.supabase.db
+      .from('semesters')
+      .select('id')
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (activeSem) {
+      const { data: pss } = await this.supabase.db
+        .from('player_semester_stats')
+        .select('placement_matches_played')
+        .eq('player_id', data.id)
+        .eq('semester_id', activeSem.id)
+        .maybeSingle();
+
+      // Always override — player_semester_stats is the source of truth
+      data.placement_matches_played = pss?.placement_matches_played ?? 0;
+    }
+
     return data;
   }
 
@@ -322,6 +374,226 @@ export class PlayersService {
     return data;
   }
 
+  /**
+   * Full public profile for a player — includes stats, peak ELO, and badges.
+   * Optionally filtered to a specific season or semester.
+   */
+  async getPublicProfile(id: string, seasonId?: string, semesterId?: string) {
+    const { data: player, error: pErr } = await this.supabase.db
+      .from('players')
+      .select(`id, first_name, last_name, gender, age, university, bio, avatar_url, current_elo, status, created_at, ${PLAYER_BADGES_EMBED}`)
+      .eq('id', id)
+      .single();
+
+    if (pErr || !player) apiError('Player not found', HttpStatus.NOT_FOUND);
+    if (player.status !== 'active') apiError('Player not found', HttpStatus.NOT_FOUND);
+
+    let wins = 0, losses = 0, currentElo = player.current_elo ?? DEFAULT_ELO, peakElo = player.current_elo ?? DEFAULT_ELO, rank = 0;
+
+    if (semesterId) {
+      const [{ data: semStats }, { data: allSem }] = await Promise.all([
+        this.supabase.db.from('player_semester_stats').select('wins, losses, elo, peak_elo').eq('player_id', id).eq('semester_id', semesterId).maybeSingle(),
+        this.supabase.db.from('player_semester_stats').select('player_id, elo').eq('semester_id', semesterId).order('elo', { ascending: false }),
+      ]);
+      if (semStats) {
+        wins = semStats.wins ?? 0;
+        losses = semStats.losses ?? 0;
+        currentElo = semStats.elo ?? DEFAULT_ELO;
+        peakElo = semStats.peak_elo ?? semStats.elo ?? DEFAULT_ELO;
+      }
+      rank = ((allSem ?? []).findIndex(s => s.player_id === id) + 1) || 0;
+    } else if (seasonId) {
+      const { data: seasonStats } = await this.supabase.db
+        .from('player_semester_stats').select('wins, losses, elo, peak_elo').eq('player_id', id).eq('season_id', seasonId);
+      if (seasonStats && seasonStats.length > 0) {
+        wins = seasonStats.reduce((s, r) => s + (r.wins ?? 0), 0);
+        losses = seasonStats.reduce((s, r) => s + (r.losses ?? 0), 0);
+        peakElo = Math.max(...seasonStats.map(r => r.peak_elo ?? r.elo ?? DEFAULT_ELO));
+        currentElo = seasonStats[seasonStats.length - 1]?.elo ?? DEFAULT_ELO;
+      }
+      const { data: seasonBoard } = await this.supabase.db
+        .from('leaderboard_season').select('player_id').eq('season_id', seasonId).order('peak_elo', { ascending: false });
+      rank = ((seasonBoard ?? []).findIndex(s => s.player_id === id) + 1) || 0;
+    } else {
+      const [{ data: activeStats }, { data: allActive }] = await Promise.all([
+        this.supabase.db.from('leaderboard_active').select('elo, peak_elo, wins, losses').eq('id', id).maybeSingle(),
+        this.supabase.db.from('leaderboard_active').select('id').order('elo', { ascending: false }),
+      ]);
+      if (activeStats) {
+        wins = activeStats.wins ?? 0;
+        losses = activeStats.losses ?? 0;
+        currentElo = activeStats.elo ?? DEFAULT_ELO;
+        peakElo = activeStats.peak_elo ?? activeStats.elo ?? DEFAULT_ELO;
+      }
+      rank = ((allActive ?? []).findIndex(s => s.id === id) + 1) || 0;
+    }
+
+    // Placement count — read from active semester stats (source of truth).
+    const { data: activeSem } = await this.supabase.db
+      .from('semesters').select('id').eq('is_active', true).maybeSingle();
+    let placementMatchesPlayed = 0;
+    if (activeSem) {
+      const { data: pss } = await this.supabase.db
+        .from('player_semester_stats')
+        .select('placement_matches_played')
+        .eq('player_id', id)
+        .eq('semester_id', activeSem.id)
+        .maybeSingle();
+      placementMatchesPlayed = pss?.placement_matches_played ?? 0;
+    }
+
+    const totalMatches = wins + losses;
+    return {
+      id: player.id,
+      first_name: player.first_name,
+      last_name: player.last_name,
+      gender: player.gender,
+      age: player.age,
+      university: player.university,
+      bio: player.bio,
+      avatar_url: player.avatar_url,
+      current_elo: currentElo,
+      peak_elo: peakElo,
+      rank: rank || null,
+      wins,
+      losses,
+      total_matches: totalMatches,
+      win_rate: totalMatches > 0 ? (wins / totalMatches) * 100 : 0,
+      placement_matches_played: placementMatchesPlayed,
+      is_ranked: placementMatchesPlayed >= 5,
+      member_since: player.created_at,
+      badges: player.player_badges,
+    };
+  }
+
+  /**
+   * Match history for a player — with partner/opponent names resolved.
+   * Optionally filtered to a specific season or semester.
+   */
+  async getPlayerMatchHistory(id: string, seasonId?: string, semesterId?: string) {
+    const { data: player } = await this.supabase.db.from('players').select('id, status').eq('id', id).single();
+    if (!player || player.status !== 'active') apiError('Player not found', HttpStatus.NOT_FOUND);
+
+    let q = this.supabase.db
+      .from('matches')
+      .select('id, team1_player1_id, team1_player2_id, team1_player3_id, team2_player1_id, team2_player2_id, team2_player3_id, winning_team, score_team1, score_team2, games, status, submitted_at, approved_at, tournament_id, season_id, semester_id, tournaments(id, name)')
+      .or(
+        `team1_player1_id.eq.${id},team1_player2_id.eq.${id},team1_player3_id.eq.${id},` +
+        `team2_player1_id.eq.${id},team2_player2_id.eq.${id},team2_player3_id.eq.${id}`,
+      )
+      .in('status', ['approved', 'pending'])
+      .not('winning_team', 'is', null)
+      .order('submitted_at', { ascending: false });
+
+    if (semesterId) q = q.eq('semester_id', semesterId);
+    else if (seasonId) q = q.eq('season_id', seasonId);
+
+    const { data: matches, error } = await q;
+    if (error) apiError(error.message);
+    if (!matches || matches.length === 0) return [];
+
+    // Batch-fetch all referenced player names in one query
+    const pidSet = new Set<string>();
+    for (const m of matches) {
+      [m.team1_player1_id, m.team1_player2_id, m.team1_player3_id,
+       m.team2_player1_id, m.team2_player2_id, m.team2_player3_id]
+        .filter(Boolean).forEach(pid => pidSet.add(pid as string));
+    }
+    const { data: playerRows } = await this.supabase.db
+      .from('players').select('id, first_name, last_name, avatar_url').in('id', [...pidSet]);
+    const pMap = new Map<string, { id: string; first_name: string; last_name: string; avatar_url: string | null }>();
+    for (const p of playerRows ?? []) pMap.set(p.id, p);
+
+    const gp = (pid: string | null) => (pid && pMap.has(pid) ? pMap.get(pid)! : null);
+
+    return matches.map(m => {
+      const t1 = [m.team1_player1_id, m.team1_player2_id, m.team1_player3_id].filter(Boolean);
+      const t2 = [m.team2_player1_id, m.team2_player2_id, m.team2_player3_id].filter(Boolean);
+      const onTeam1 = t1.includes(id);
+      // A rotating session's odd team has two teammates; `partner` stays the
+      // first for existing callers, `partners` has them all.
+      const partnerIds = (onTeam1 ? t1 : t2).filter(p => p !== id);
+      const partnerId = partnerIds[0] ?? null;
+      const oppIds = onTeam1 ? t2 : t1;
+      const myTeam = onTeam1 ? 1 : 2;
+      const won = m.winning_team === myTeam;
+      const tournament = (m.tournaments as unknown) as { id: string; name: string } | { id: string; name: string }[] | null;
+      const t = Array.isArray(tournament) ? tournament[0] ?? null : tournament;
+      return {
+        id: m.id,
+        date: m.approved_at ?? m.submitted_at,
+        status: m.status,
+        tournament: t ? { id: t.id, name: t.name } : null,
+        partner: gp(partnerId as string | null),
+        partners: partnerIds.map(p => gp(p as string)).filter(Boolean),
+        opponents: oppIds.map(p => gp(p as string)).filter(Boolean),
+        my_team: myTeam,
+        winning_team: m.winning_team,
+        won,
+        score_for: onTeam1 ? m.score_team1 : m.score_team2,
+        score_against: onTeam1 ? m.score_team2 : m.score_team1,
+        games: m.games,
+      };
+    });
+  }
+
+  /**
+   * Head-to-head record between two players across all approved matches
+   * where they appeared on opposite teams.
+   */
+  async getHeadToHead(id: string, otherId: string) {
+    const [{ data: p1 }, { data: p2 }] = await Promise.all([
+      this.supabase.db.from('players').select('id, first_name, last_name, avatar_url, current_elo, status').eq('id', id).single(),
+      this.supabase.db.from('players').select('id, first_name, last_name, avatar_url, current_elo, status').eq('id', otherId).single(),
+    ]);
+    if (!p1 || p1.status !== 'active') apiError('Player not found', HttpStatus.NOT_FOUND);
+    if (!p2 || p2.status !== 'active') apiError('Other player not found', HttpStatus.NOT_FOUND);
+
+    const { data: matches, error } = await this.supabase.db
+      .from('matches')
+      .select('id, team1_player1_id, team1_player2_id, team2_player1_id, team2_player2_id, winning_team, score_team1, score_team2, games, submitted_at, approved_at, tournaments(id, name)')
+      .eq('status', 'approved')
+      .not('winning_team', 'is', null)
+      .order('approved_at', { ascending: false });
+
+    if (error) apiError(error.message);
+
+    const h2h = (matches ?? []).filter(m => {
+      const t1 = [m.team1_player1_id, m.team1_player2_id];
+      const t2 = [m.team2_player1_id, m.team2_player2_id];
+      return (t1.includes(id) && t2.includes(otherId)) || (t2.includes(id) && t1.includes(otherId));
+    });
+
+    let winsById = 0, winsByOther = 0;
+    const matchResults = h2h.map(m => {
+      const t1 = [m.team1_player1_id, m.team1_player2_id];
+      const idOnT1 = t1.includes(id);
+      const myTeam = idOnT1 ? 1 : 2;
+      const won = m.winning_team === myTeam;
+      if (won) winsById++; else winsByOther++;
+      const rawT = (m.tournaments as unknown) as { id: string; name: string } | { id: string; name: string }[] | null;
+      const t2 = Array.isArray(rawT) ? rawT[0] ?? null : rawT;
+      return {
+        id: m.id,
+        date: m.approved_at ?? m.submitted_at,
+        tournament: t2 ? { id: t2.id, name: t2.name } : null,
+        winner: won ? 'player' : 'other',
+        score_player: idOnT1 ? m.score_team1 : m.score_team2,
+        score_against: idOnT1 ? m.score_team2 : m.score_team1,
+        games: m.games,
+      };
+    });
+
+    return {
+      player: { id: p1.id, first_name: p1.first_name, last_name: p1.last_name, avatar_url: p1.avatar_url, current_elo: p1.current_elo },
+      other: { id: p2.id, first_name: p2.first_name, last_name: p2.last_name, avatar_url: p2.avatar_url, current_elo: p2.current_elo },
+      wins: winsById,
+      losses: winsByOther,
+      total_matches: h2h.length,
+      matches: matchResults,
+    };
+  }
+
   async getEloHistory(id: string, semesterId?: string, seasonId?: string) {
     let query = this.supabase.db
       .from('elo_history')
@@ -357,7 +629,40 @@ export class PlayersService {
       .single();
 
     if (error || !data) apiError('Player not found', HttpStatus.NOT_FOUND);
+
+    // Fire-and-forget: a failed welcome email must never fail the approval.
+    this.notifyApproved(data).catch((err) =>
+      console.error('[PlayersService] approval notification failed:', err),
+    );
+
     return data;
+  }
+
+  /** Welcome notification + email sent once a sign-up is approved. */
+  private async notifyApproved(player: {
+    id: string; first_name: string; email: string | null;
+  }) {
+    const greeting = `What up Spiker ${player.first_name}, you are ready for some spiking action! Good luck`;
+
+    await this.notifs.create({
+      playerId: player.id,
+      // ponytail: 'general' avoids a new enum value + DB check-constraint
+      // migration. Add a dedicated type if approvals ever need their own icon.
+      type: 'general',
+      title: "You're approved!",
+      body: greeting,
+      link: '/dashboard',
+    });
+
+    if (!player.email) return;
+    await this.mail.sendNotification({
+      to: player.email,
+      subject: "You're approved — welcome to OU Roundnet!",
+      title: "You're in!",
+      body: greeting,
+      link: '/dashboard',
+      linkLabel: 'Open Your Dashboard',
+    });
   }
 
   /**

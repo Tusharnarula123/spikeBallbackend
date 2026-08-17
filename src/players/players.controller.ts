@@ -22,6 +22,12 @@ import { PlayersService } from './players.service';
 export class PlayersController {
   constructor(private readonly players: PlayersService) {}
 
+  @Public()
+  @Get('search')
+  searchPublic(@Query('q') q?: string) {
+    return this.players.searchPublic(q);
+  }
+
   @Get()
   list(
     @AuthUser() auth: ClerkUser,
@@ -44,6 +50,12 @@ export class PlayersController {
     return this.players.listPending();
   }
 
+  @Get('all')
+  @UseGuards(AdminGuard)
+  listAll(@Query('search') search?: string) {
+    return this.players.listAll(search);
+  }
+
   @Get(':id')
   getById(@Param('id', ParseUUIDPipe) id: string) {
     return this.players.getById(id);
@@ -57,6 +69,35 @@ export class PlayersController {
     @Query('seasonId')   seasonId?: string,
   ) {
     return this.players.getEloHistory(id, semesterId, seasonId);
+  }
+
+  @Public()
+  @Get(':id/profile')
+  getPublicProfile(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query('seasonId')   seasonId?: string,
+    @Query('semesterId') semesterId?: string,
+  ) {
+    return this.players.getPublicProfile(id, seasonId, semesterId);
+  }
+
+  @Public()
+  @Get(':id/match-history')
+  getPlayerMatchHistory(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query('seasonId')   seasonId?: string,
+    @Query('semesterId') semesterId?: string,
+  ) {
+    return this.players.getPlayerMatchHistory(id, seasonId, semesterId);
+  }
+
+  @Public()
+  @Get(':id/vs/:otherId')
+  getHeadToHead(
+    @Param('id', ParseUUIDPipe)      id: string,
+    @Param('otherId', ParseUUIDPipe) otherId: string,
+  ) {
+    return this.players.getHeadToHead(id, otherId);
   }
 
   @Patch(':id/approve')

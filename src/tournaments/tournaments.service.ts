@@ -1,7 +1,9 @@
 import { HttpStatus, Injectable } from '@nestjs/common';
 import { ClerkUser } from '../auth/auth.types';
 import { apiError } from '../common/api-error';
+import { DEFAULT_ELO } from '../common/config';
 import { getPlayerByClerkId } from '../common/player.helpers';
+import { assignRound, updateHistory, ByeHistory, PairHistory } from '../lib/net-assignment';
 import { MailService } from '../lib/mail.service';
 import { NotificationsService, CreateNotificationInput } from '../notifications/notifications.service';
 import { SupabaseService } from '../supabase/supabase.service';
@@ -58,6 +60,17 @@ export class TournamentsService {
     private readonly mail: MailService,
   ) {}
 
+  /** Active semester id — required on every match so semester stats work. */
+  private async getActiveSemesterId(): Promise<string> {
+    const { data } = await this.supabase.db
+      .from('semesters')
+      .select('id')
+      .eq('is_active', true)
+      .maybeSingle();
+    if (!data) apiError('No active semester — an admin must activate a semester before matches can be created');
+    return data!.id;
+  }
+
   async list(status?: string) {
     let query = this.supabase.db
       .from('tournaments')
@@ -100,8 +113,8 @@ export class TournamentsService {
     if (teamFormation && !['random', 'self_select'].includes(teamFormation as string)) {
       apiError('teamFormation must be "random" or "self_select"');
     }
-    if (tournamentType && !['bracket', 'round_robin'].includes(tournamentType as string)) {
-      apiError('tournamentType must be "bracket" or "round_robin"');
+    if (tournamentType && !['bracket', 'round_robin', 'rotating'].includes(tournamentType as string)) {
+      apiError('tournamentType must be "bracket", "round_robin", or "rotating"');
     }
 
     const { data, error } = await this.supabase.db
@@ -338,7 +351,12 @@ export class TournamentsService {
       .eq('id', tournamentId)
       .single();
     if (!tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
-    if (tournament.status !== 'registration_open') {
+    // Late signups are allowed while play is under way. Existing matches are
+    // never touched: a rotating session picks the new player up in its next
+    // round, and bracket/round-robin tournaments get appended matches via
+    // addLateTeams(). 'registration_closed' still blocks — that's an admin
+    // deliberately shutting the door.
+    if (!['registration_open', 'in_progress'].includes(tournament.status as string)) {
       apiError('Registration is not open for this tournament');
     }
 
@@ -434,7 +452,12 @@ export class TournamentsService {
       .eq('id', tournamentId)
       .single();
     if (!tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
-    if (tournament.status !== 'registration_open') {
+    // Late signups are allowed while play is under way. Existing matches are
+    // never touched: a rotating session picks the new player up in its next
+    // round, and bracket/round-robin tournaments get appended matches via
+    // addLateTeams(). 'registration_closed' still blocks — that's an admin
+    // deliberately shutting the door.
+    if (!['registration_open', 'in_progress'].includes(tournament.status as string)) {
       apiError('Registration is not open for this tournament');
     }
 
@@ -762,6 +785,358 @@ export class TournamentsService {
     return { tournament, rounds, pools: [] };
   }
 
+  /**
+   * Late signups for a bracket / round-robin tournament that's already under way.
+   *
+   * Pairs any registrants who don't have a team yet (formTeams already skips
+   * players who do), then creates matches ONLY between teams that have no
+   * matches at all. Existing brackets and matchups are never rewritten — the
+   * new matches are appended at the next free slot.
+   *
+   * Rotating sessions don't need this: each round is built fresh from the
+   * current roster, so a late player is picked up by the next round and team
+   * sizes recompute (13 players -> one team of 3; 14 -> that trio splits into
+   * two pairs).
+   */
+  async addLateTeams(auth: ClerkUser, tournamentId: string) {
+    const admin = await getPlayerByClerkId(this.supabase, auth.userId);
+    if (!admin) apiError('Admin player record not found', HttpStatus.NOT_FOUND);
+
+    const { data: tournament } = await this.supabase.db
+      .from('tournaments')
+      .select('id, name, status, season_id, tournament_type')
+      .eq('id', tournamentId)
+      .single();
+    if (!tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
+
+    const type = (tournament as Record<string, unknown>).tournament_type as string;
+    if (type === 'rotating') {
+      apiError('Rotating sessions add late players automatically — just generate the next round');
+    }
+
+    // Pair up anyone still without a team. Safe to call repeatedly: it only
+    // looks at registrations with team_id null.
+    const { count: unpairedCount } = await this.supabase.db
+      .from('tournament_registrations')
+      .select('id', { count: 'exact', head: true })
+      .eq('tournament_id', tournamentId)
+      .is('team_id', null);
+    if ((unpairedCount ?? 0) >= 2) await this.formTeams(tournamentId);
+
+    const { data: teams } = await this.supabase.db
+      .from('tournament_teams')
+      .select('id, player1_id, player2_id')
+      .eq('tournament_id', tournamentId);
+
+    const { data: existingMatches } = await this.supabase.db
+      .from('matches')
+      .select('bracket_round, bracket_slot, rr_pool, rr_round, team1_player1_id, team1_player2_id, team2_player1_id, team2_player2_id')
+      .eq('tournament_id', tournamentId);
+
+    const played = new Set<string>();
+    for (const m of existingMatches ?? []) {
+      for (const pid of [m.team1_player1_id, m.team1_player2_id, m.team2_player1_id, m.team2_player2_id]) {
+        if (pid) played.add(pid as string);
+      }
+    }
+
+    // A team is "new" only if neither of its players appears in any match yet.
+    const newTeams = (teams ?? []).filter(
+      (t) => !played.has(t.player1_id) && !played.has(t.player2_id),
+    );
+
+    if (newTeams.length === 0) {
+      return { matchesCreated: 0, unmatchedTeams: 0, message: 'No new teams to add — everyone already has matches' };
+    }
+    if (newTeams.length === 1) {
+      return {
+        matchesCreated: 0,
+        unmatchedTeams: 1,
+        message: 'One new team is waiting for an opponent — add it once another team signs up',
+      };
+    }
+
+    let seasonId = (tournament as Record<string, unknown>).season_id as string | null;
+    if (!seasonId) {
+      const { data: activeSeason } = await this.supabase.db
+        .from('seasons').select('id').eq('is_active', true).single();
+      if (!activeSeason) apiError('No season linked to this tournament and no active season found');
+      seasonId = activeSeason!.id;
+    }
+    const semesterId = await this.getActiveSemesterId();
+
+    const isRR = type === 'round_robin';
+    // Append after everything that exists, so nothing already scheduled moves.
+    const nextSlot = (existingMatches ?? []).reduce(
+      (max, m) => Math.max(max, ((m.bracket_slot as number) ?? -1) + 1), 0,
+    );
+    const nextPool = (existingMatches ?? []).reduce(
+      (max, m) => Math.max(max, ((m.rr_pool as number) ?? -1) + 1), 0,
+    );
+
+    const shuffledTeams = [...newTeams];
+    for (let i = shuffledTeams.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffledTeams[i], shuffledTeams[j]] = [shuffledTeams[j], shuffledTeams[i]];
+    }
+
+    const matchInserts: Record<string, unknown>[] = [];
+    for (let i = 0; i + 1 < shuffledTeams.length; i += 2) {
+      const t1 = shuffledTeams[i];
+      const t2 = shuffledTeams[i + 1];
+      matchInserts.push({
+        season_id:        seasonId,
+        semester_id:      semesterId,
+        tournament_id:    tournamentId,
+        team1_player1_id: t1.player1_id,
+        team1_player2_id: t1.player2_id,
+        team2_player1_id: t2.player1_id,
+        team2_player2_id: t2.player2_id,
+        status:           'pending',
+        submitted_by:     admin!.id,
+        ...(isRR
+          ? { rr_pool: nextPool, rr_round: 1 }
+          : { bracket_round: 1, bracket_slot: nextSlot + i / 2 }),
+      });
+    }
+
+    const leftover = shuffledTeams.length % 2 === 1 ? 1 : 0;
+
+    const { data: created, error: insertError } = await this.supabase.db
+      .from('matches')
+      .insert(matchInserts)
+      .select('id');
+    if (insertError) apiError(insertError.message);
+
+    return {
+      matchesCreated: created?.length ?? 0,
+      unmatchedTeams: leftover,
+      message:
+        `Added ${created?.length ?? 0} match(es) for late teams` +
+        (leftover ? ', 1 team still waiting for an opponent' : ''),
+    };
+  }
+
+  /**
+   * Rotating competitive session: builds ONE round at a time. Registered
+   * players are split into ELO-similar nets, and each net becomes a match.
+   * Teammates and opponents change every round because previous rounds are
+   * fed back in as pair history, so the same four players don't stay together.
+   */
+  async generateRotatingRound(auth: ClerkUser, tournamentId: string) {
+    const admin = await getPlayerByClerkId(this.supabase, auth.userId);
+    if (!admin) apiError('Admin player record not found', HttpStatus.NOT_FOUND);
+
+    const { data: tournament } = await this.supabase.db
+      .from('tournaments')
+      .select('id, name, status, season_id, tournament_type')
+      .eq('id', tournamentId)
+      .single();
+    if (!tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
+    if ((tournament as Record<string, unknown>).tournament_type !== 'rotating') {
+      apiError('This is not a rotating competitive session');
+    }
+
+    // Registered players + their current ELO
+    const { data: regs, error: regError } = await this.supabase.db
+      .from('tournament_registrations')
+      .select('player_id, players(id, first_name, last_name, current_elo, status)')
+      .eq('tournament_id', tournamentId);
+    if (regError) apiError('Failed to load registrations');
+
+    const roster = (regs ?? [])
+      .map((r) => (r as Record<string, unknown>).players as
+        { id: string; first_name: string; last_name: string; current_elo: number | null; status: string } | null)
+      .filter((p): p is NonNullable<typeof p> => !!p && p.status === 'active')
+      .map((p) => ({ id: p.id, elo: p.current_elo ?? DEFAULT_ELO }));
+
+    if (roster.length < 4) {
+      apiError('Need at least 4 registered players to generate a round');
+    }
+
+    // Existing rounds — used both to number this round and to avoid repeats.
+    const { data: priorMatches } = await this.supabase.db
+      .from('matches')
+      .select(`
+        rr_round, status,
+        team1_player1_id, team1_player2_id, team1_player3_id,
+        team2_player1_id, team2_player2_id, team2_player3_id
+      `)
+      .eq('tournament_id', tournamentId)
+      .not('rr_round', 'is', null);
+
+    const prior = priorMatches ?? [];
+    const nextRound = prior.reduce((max, m) => Math.max(max, (m.rr_round as number) ?? 0), 0) + 1;
+
+    // Don't stack a new round on top of one that hasn't been played yet.
+    const unplayed = prior.filter(
+      (m) => (m.rr_round as number) === nextRound - 1 && m.status === 'pending',
+    );
+    if (unplayed.length > 0) {
+      apiError(
+        `Round ${nextRound - 1} still has ${unplayed.length} match(es) awaiting scores — finish it before generating the next round`,
+      );
+    }
+
+    // Replay prior rounds so this one avoids repeating teammates/opponents,
+    // and so byes land on whoever has sat out least.
+    const history: PairHistory = {};
+    const byes: ByeHistory = {};
+    const rosterIds = new Set(roster.map((p) => p.id));
+    const playedByRound = new Map<number, Set<string>>();
+
+    for (const m of prior) {
+      const round = (m.rr_round as number) ?? 0;
+      if (!playedByRound.has(round)) playedByRound.set(round, new Set());
+      const played = playedByRound.get(round)!;
+
+      const t1 = [m.team1_player1_id, m.team1_player2_id, m.team1_player3_id].filter(Boolean) as string[];
+      const t2 = [m.team2_player1_id, m.team2_player2_id, m.team2_player3_id].filter(Boolean) as string[];
+      for (const id of [...t1, ...t2]) played.add(id);
+
+      updateHistory(
+        { nets: [{ team1: t1.map((id) => ({ id, elo: 0 })), team2: t2.map((id) => ({ id, elo: 0 })) }], bye: [] },
+        history,
+        byes,
+      );
+    }
+
+    // Anyone on the roster who didn't appear in a past round sat that one out.
+    for (const played of playedByRound.values()) {
+      for (const id of rosterIds) {
+        if (!played.has(id)) byes[id] = (byes[id] ?? 0) + 1;
+      }
+    }
+
+    const { nets, bye } = assignRound(roster, history, byes);
+
+    let seasonId = (tournament as Record<string, unknown>).season_id as string | null;
+    if (!seasonId) {
+      const { data: activeSeason } = await this.supabase.db
+        .from('seasons').select('id').eq('is_active', true).single();
+      if (!activeSeason) apiError('No season linked to this session and no active season found');
+      seasonId = activeSeason!.id;
+    }
+    const semesterId = await this.getActiveSemesterId();
+
+    const matchInserts = nets.map(({ team1, team2 }, netIdx) => ({
+      season_id:        seasonId,
+      semester_id:      semesterId,
+      tournament_id:    tournamentId,
+      team1_player1_id: team1[0].id,
+      team1_player2_id: team1[1]?.id ?? null,
+      team1_player3_id: team1[2]?.id ?? null,
+      team2_player1_id: team2[0].id,
+      team2_player2_id: team2[1]?.id ?? null,
+      team2_player3_id: team2[2]?.id ?? null,
+      status:           'pending',
+      rr_pool:          netIdx,      // net number
+      rr_round:         nextRound,
+      submitted_by:     admin!.id,
+    }));
+
+    const { data: created, error: insertError } = await this.supabase.db
+      .from('matches')
+      .insert(matchInserts)
+      .select('id');
+    if (insertError) apiError(insertError.message);
+
+    if ((tournament as Record<string, unknown>).status !== 'in_progress') {
+      await this.supabase.db
+        .from('tournaments')
+        .update({ status: 'in_progress' })
+        .eq('id', tournamentId);
+    }
+
+    return {
+      round: nextRound,
+      nets: nets.length,
+      byePlayerIds: bye.map((p) => p.id),
+      matchesCreated: created?.length ?? 0,
+      message:
+        `Round ${nextRound} created — ${nets.length} net(s) for ${roster.length} players` +
+        (bye.length ? `, ${bye.length} sitting out this round` : ''),
+    };
+  }
+
+  /**
+   * Rotating session view: matches grouped into rounds of nets, plus a
+   * per-player win/loss table for the session (players rotate partners, so
+   * standings are individual rather than by team).
+   */
+  async getRotatingRounds(tournamentId: string) {
+    const { data: tournament, error: tErr } = await this.supabase.db
+      .from('tournaments')
+      .select('*')
+      .eq('id', tournamentId)
+      .single();
+    if (tErr || !tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
+
+    const { data: matches, error: mErr } = await this.supabase.db
+      .from('matches')
+      .select(`
+        id, rr_pool, rr_round, status, winning_team, score_team1, score_team2,
+        team1_player1_id, team1_player2_id, team1_player3_id,
+        team2_player1_id, team2_player2_id, team2_player3_id,
+        team1_player1:players!team1_player1_id ( id, first_name, last_name ),
+        team1_player2:players!team1_player2_id ( id, first_name, last_name ),
+        team1_player3:players!team1_player3_id ( id, first_name, last_name ),
+        team2_player1:players!team2_player1_id ( id, first_name, last_name ),
+        team2_player2:players!team2_player2_id ( id, first_name, last_name ),
+        team2_player3:players!team2_player3_id ( id, first_name, last_name )
+      `)
+      .eq('tournament_id', tournamentId)
+      .not('rr_round', 'is', null)
+      .order('rr_round', { ascending: true })
+      .order('rr_pool', { ascending: true });
+    if (mErr) apiError(mErr.message);
+
+    const rows = (matches ?? []) as Record<string, unknown>[];
+
+    // Group into rounds
+    const byRound = new Map<number, Record<string, unknown>[]>();
+    for (const m of rows) {
+      const r = m.rr_round as number;
+      if (!byRound.has(r)) byRound.set(r, []);
+      byRound.get(r)!.push(m);
+    }
+    const rounds = Array.from(byRound.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([round, nets]) => ({ round, nets }));
+
+    // Individual standings — approved matches only
+    type Standing = { id: string; name: string; wins: number; losses: number };
+    const standings = new Map<string, Standing>();
+    const bump = (
+      p: { id: string; first_name: string; last_name: string } | null,
+      won: boolean,
+    ) => {
+      if (!p) return;
+      if (!standings.has(p.id)) {
+        standings.set(p.id, { id: p.id, name: `${p.first_name} ${p.last_name}`, wins: 0, losses: 0 });
+      }
+      const s = standings.get(p.id)!;
+      if (won) s.wins += 1;
+      else s.losses += 1;
+    };
+
+    type P = { id: string; first_name: string; last_name: string } | null;
+    for (const m of rows) {
+      if (m.status !== 'approved' || !m.winning_team) continue;
+      const t1Won = m.winning_team === 1;
+      for (const key of ['team1_player1', 'team1_player2', 'team1_player3']) bump(m[key] as P, t1Won);
+      for (const key of ['team2_player1', 'team2_player2', 'team2_player3']) bump(m[key] as P, !t1Won);
+    }
+
+    return {
+      tournament,
+      rounds,
+      standings: Array.from(standings.values()).sort(
+        (a, b) => b.wins - a.wins || a.losses - b.losses || a.name.localeCompare(b.name),
+      ),
+    };
+  }
+
   async generateRoundRobin(auth: ClerkUser, tournamentId: string) {
     const admin = await getPlayerByClerkId(this.supabase, auth.userId);
     if (!admin) apiError('Admin player record not found', HttpStatus.NOT_FOUND);
@@ -802,6 +1177,7 @@ export class TournamentsService {
       if (!activeSeason) apiError('No season linked to this tournament and no active season found');
       seasonId = activeSeason!.id;
     }
+    const semesterId = await this.getActiveSemesterId();
 
     // Shuffle teams (Fisher-Yates)
     const shuffled = [...teams];
@@ -842,6 +1218,7 @@ export class TournamentsService {
         for (const [teamA, teamB] of roundPairs) {
           matchInserts.push({
             season_id:        seasonId,
+            semester_id:      semesterId,
             tournament_id:    tournamentId,
             team1_player1_id: teamA.player1_id,
             team1_player2_id: teamA.player2_id,
@@ -980,6 +1357,7 @@ export class TournamentsService {
         .from('seasons').select('id').eq('is_active', true).single();
       if (activeSeason) seasonId = activeSeason.id;
     }
+    const semesterId = await this.getActiveSemesterId();
 
     // ── Single pool: top 2 teams in that pool play one final match ────────
     if (poolIndices.length === 1) {
@@ -991,6 +1369,7 @@ export class TournamentsService {
         .from('matches')
         .insert({
           season_id:        seasonId,
+          semester_id:      semesterId,
           tournament_id:    tournamentId,
           team1_player1_id: first.player1_id,
           team1_player2_id: first.player2_id,
@@ -1020,6 +1399,7 @@ export class TournamentsService {
         .from('matches')
         .insert({
           season_id:        seasonId,
+          semester_id:      semesterId,
           tournament_id:    tournamentId,
           team1_player1_id: leaders[0].player1_id,
           team1_player2_id: leaders[0].player2_id,
@@ -1051,6 +1431,7 @@ export class TournamentsService {
       for (const [teamA, teamB] of roundPairs) {
         matchInserts.push({
           season_id:        seasonId,
+          semester_id:      semesterId,
           tournament_id:    tournamentId,
           team1_player1_id: teamA.player1_id,
           team1_player2_id: teamA.player2_id,
@@ -1119,6 +1500,7 @@ export class TournamentsService {
       if (!activeSeason.data) apiError('No season linked to this tournament and no active season found');
       seasonId = activeSeason.data!.id;
     }
+    const semesterId = await this.getActiveSemesterId();
 
     // Shuffle teams (Fisher-Yates)
     const shuffled = [...teams];
