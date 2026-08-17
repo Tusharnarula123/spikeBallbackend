@@ -52,6 +52,13 @@ export class BadgesController {
     return this.badges.delete(id);
   }
 
+  /** Remove a badge from a player. `id` is the player_badges row id. */
+  @Delete('awarded/:id')
+  @UseGuards(AdminGuard)
+  revoke(@Param('id') id: string) {
+    return this.badges.revoke(id);
+  }
+
   /** Body: { playerId, badgeId, tournamentId? } */
   @Post('award')
   @UseGuards(AdminGuard)

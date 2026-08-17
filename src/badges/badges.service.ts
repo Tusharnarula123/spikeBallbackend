@@ -4,6 +4,8 @@ import { v2 as cloudinary } from 'cloudinary';
 import { ClerkUser } from '../auth/auth.types';
 import { apiError } from '../common/api-error';
 import { getPlayerByClerkId } from '../common/player.helpers';
+import { MailService } from '../lib/mail.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { SupabaseService } from '../supabase/supabase.service';
 
 const TRIGGER_TYPES = [
@@ -20,6 +22,8 @@ export class BadgesService {
   constructor(
     private readonly supabase: SupabaseService,
     private readonly config: ConfigService,
+    private readonly notifs: NotificationsService,
+    private readonly mail: MailService,
   ) {
     cloudinary.config({
       cloud_name: this.config.get<string>('CLOUDINARY_CLOUD_NAME'),
@@ -160,7 +164,7 @@ export class BadgesService {
 
     const { data: badge } = await this.supabase.db
       .from('badges')
-      .select('id')
+      .select('id, name, description')
       .eq('id', badgeId)
       .maybeSingle();
     if (!badge) apiError('Badge not found', HttpStatus.NOT_FOUND);
@@ -205,6 +209,76 @@ export class BadgesService {
     if (error) {
       apiError(error.code === '23505' ? 'This player already has this badge' : error.message);
     }
+
+    // Fire-and-forget: a failed notification must never fail the award.
+    this.notifyBadge(playerId, badge!.name as string, 'awarded').catch((err) =>
+      console.error('[BadgesService] award notification failed:', err),
+    );
+
     return data;
+  }
+
+  /**
+   * Admin removes a badge a player currently holds.
+   * Takes the player_badges row id — a player can hold the same badge for
+   * several tournaments, so badgeId alone wouldn't identify which to remove.
+   */
+  async revoke(id: string) {
+    const { data: row } = await this.supabase.db
+      .from('player_badges')
+      .select('id, player_id, badges(name)')
+      .eq('id', id)
+      .maybeSingle();
+    if (!row) apiError('This player does not have that badge', HttpStatus.NOT_FOUND);
+
+    const { error } = await this.supabase.db.from('player_badges').delete().eq('id', id);
+    if (error) apiError(error.message);
+
+    const badge = row.badges as unknown as { name: string } | { name: string }[] | null;
+    const badgeName = (Array.isArray(badge) ? badge[0]?.name : badge?.name) ?? 'A badge';
+
+    this.notifyBadge(row.player_id as string, badgeName, 'removed').catch((err) =>
+      console.error('[BadgesService] revoke notification failed:', err),
+    );
+
+    return { removed: true, id };
+  }
+
+  /** In-app notification + email when a badge is awarded or removed. */
+  private async notifyBadge(
+    playerId: string,
+    badgeName: string,
+    action: 'awarded' | 'removed',
+  ) {
+    const { data: player } = await this.supabase.db
+      .from('players')
+      .select('id, first_name, email')
+      .eq('id', playerId)
+      .maybeSingle();
+    if (!player) return;
+
+    const awarded = action === 'awarded';
+    const title = awarded ? 'New badge unlocked!' : 'A badge was removed';
+    const body = awarded
+      ? `Nice work ${player.first_name} — you've been awarded the "${badgeName}" badge!`
+      : `Your "${badgeName}" badge has been removed by an admin.`;
+
+    await this.notifs.create({
+      playerId,
+      type: 'general',
+      title,
+      body,
+      link: '/dashboard/profile',
+    });
+
+    if (!player.email) return;
+    await this.mail.sendNotification({
+      to: player.email,
+      subject: awarded ? `You earned the "${badgeName}" badge!` : `Your "${badgeName}" badge was removed`,
+      title,
+      body,
+      link: '/dashboard/profile',
+      linkLabel: 'View Your Profile',
+    });
   }
 }

@@ -12,8 +12,10 @@ import { SupabaseService } from '../supabase/supabase.service';
 
 // player_badges has two FKs to players (player_id + awarded_by) — must disambiguate.
 // tournament_id is nullable: badges earned outside a specific tournament show no tournament.
+// `id` is the player_badges row id — admins need it to revoke a single award,
+// since a player can hold the same badge for several tournaments.
 const PLAYER_BADGES_EMBED =
-  'player_badges!player_id(badge_id, awarded_at, tournament_id, badges(name, icon_name, icon_url, description), tournament:tournaments(id, name))';
+  'player_badges!player_id(id, badge_id, awarded_at, tournament_id, badges(name, icon_name, icon_url, description), tournament:tournaments(id, name))';
 
 @Injectable()
 export class PlayersService {
