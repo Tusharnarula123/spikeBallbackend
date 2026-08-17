@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { AppController } from './app.controller';
 import { AboutModule } from './about/about.module';
 import { AnnouncementsModule } from './announcements/announcements.module';
 import { GalleryModule } from './gallery/gallery.module';
@@ -36,5 +37,6 @@ import { RedisModule } from './lib/redis.module';
     NotificationsModule,
     AboutModule,
   ],
+  controllers: [AppController],
 })
 export class AppModule {}

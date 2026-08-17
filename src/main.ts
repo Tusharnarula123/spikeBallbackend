@@ -11,7 +11,9 @@ import { HttpExceptionFilter } from './common/http-exception.filter';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  app.setGlobalPrefix('api');
+  // 'health' stays outside /api so it resolves at exactly /health —
+  // that's the path Render's Health Check is already configured to hit.
+  app.setGlobalPrefix('api', { exclude: ['health'] });
   app.use(cookieParser());
 
   // FRONTEND_URL may be comma-separated to allow multiple origins

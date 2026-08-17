@@ -84,9 +84,11 @@ export class MatchesService {
     else if (query.seasonId) q = q.eq('season_id', query.seasonId);
     if (query.status) q = q.eq('status', query.status);
     if (query.playerId) {
+      // Includes the 3rd slot so a rotating session's odd-team-out player
+      // shows up in their own match list too.
       q = q.or(
-        `team1_player1_id.eq.${query.playerId},team1_player2_id.eq.${query.playerId},` +
-          `team2_player1_id.eq.${query.playerId},team2_player2_id.eq.${query.playerId}`,
+        `team1_player1_id.eq.${query.playerId},team1_player2_id.eq.${query.playerId},team1_player3_id.eq.${query.playerId},` +
+          `team2_player1_id.eq.${query.playerId},team2_player2_id.eq.${query.playerId},team2_player3_id.eq.${query.playerId}`,
       );
     }
 
@@ -312,8 +314,8 @@ export class MatchesService {
       .from('matches')
       .select('*, tournament:tournaments(affects_elo)')
       .or(
-        `team1_player1_id.eq.${player.id},team1_player2_id.eq.${player.id},` +
-          `team2_player1_id.eq.${player.id},team2_player2_id.eq.${player.id}`,
+        `team1_player1_id.eq.${player.id},team1_player2_id.eq.${player.id},team1_player3_id.eq.${player.id},` +
+          `team2_player1_id.eq.${player.id},team2_player2_id.eq.${player.id},team2_player3_id.eq.${player.id}`,
       )
       .order('submitted_at', { ascending: false })
       .limit(100);
