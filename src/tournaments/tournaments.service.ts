@@ -937,15 +937,18 @@ export class TournamentsService {
       apiError('This is not a rotating competitive session');
     }
 
-    // Registered players + their current ELO
+    // Registered players + their current ELO.
+    // tournament_registrations has two FKs to players (player_id and
+    // preferred_partner_id), so the embed must name which one — a bare
+    // `players(...)` is ambiguous and PostgREST rejects the whole query.
     const { data: regs, error: regError } = await this.supabase.db
       .from('tournament_registrations')
-      .select('player_id, players(id, first_name, last_name, current_elo, status)')
+      .select('player_id, player:players!player_id(id, first_name, last_name, current_elo, status)')
       .eq('tournament_id', tournamentId);
-    if (regError) apiError('Failed to load registrations');
+    if (regError) apiError(`Failed to load registrations: ${regError.message}`);
 
     const roster = (regs ?? [])
-      .map((r) => (r as Record<string, unknown>).players as
+      .map((r) => (r as Record<string, unknown>).player as
         { id: string; first_name: string; last_name: string; current_elo: number | null; status: string } | null)
       .filter((p): p is NonNullable<typeof p> => !!p && p.status === 'active')
       .map((p) => ({ id: p.id, elo: p.current_elo ?? DEFAULT_ELO }));
@@ -1065,12 +1068,23 @@ export class TournamentsService {
    * standings are individual rather than by team).
    */
   async getRotatingRounds(tournamentId: string) {
-    const { data: tournament, error: tErr } = await this.supabase.db
+    // registration_count isn't a column — it's derived from the registrations
+    // embed, the same way list() does it. Selecting '*' alone left it
+    // undefined, which the UI rendered as "0 registered".
+    const { data: tournamentRow, error: tErr } = await this.supabase.db
       .from('tournaments')
-      .select('*')
+      .select('*, tournament_registrations(count)')
       .eq('id', tournamentId)
       .single();
-    if (tErr || !tournament) apiError('Tournament not found', HttpStatus.NOT_FOUND);
+    if (tErr || !tournamentRow) apiError('Tournament not found', HttpStatus.NOT_FOUND);
+
+    const tRow = tournamentRow as Record<string, unknown>;
+    const tournament = {
+      ...tRow,
+      registration_count:
+        (tRow.tournament_registrations as { count: number }[] | undefined)?.[0]?.count ?? 0,
+      tournament_registrations: undefined,
+    };
 
     const { data: matches, error: mErr } = await this.supabase.db
       .from('matches')

@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { apiError } from '../common/api-error';
-import { DEFAULT_ELO } from '../common/config';
+import { DEFAULT_ELO, PLACEMENT_MATCHES_REQUIRED } from '../common/config';
 import { SupabaseService } from '../supabase/supabase.service';
 
 @Injectable()
@@ -14,7 +14,25 @@ export class LeaderboardService {
     const { data, error } = await query;
     if (error) apiError(error.message);
 
-    return (data ?? []).map((p, i) => {
+    const rows = data ?? [];
+
+    // leaderboard_active.placement_matches_played is a cached column that reads
+    // 0 for anyone whose matches were tagged with a wrong/null semester. Count
+    // elo_history instead (one row per player per ELO-affecting match) in a
+    // single round-trip, tallied per player in JS.
+    const ids = rows.map((p) => p.id).filter(Boolean);
+    const { data: eloRows, error: eloError } = ids.length
+      ? await this.supabase.db.from('elo_history').select('player_id').in('player_id', ids)
+      : { data: [] as { player_id: string }[], error: null };
+
+    const counts = new Map<string, number>();
+    if (!eloError) {
+      for (const r of (eloRows ?? []) as { player_id: string }[]) {
+        counts.set(r.player_id, (counts.get(r.player_id) ?? 0) + 1);
+      }
+    }
+
+    return rows.map((p, i) => {
       const wins = p.wins ?? 0;
       const losses = p.losses ?? 0;
       const totalMatches = wins + losses;
@@ -29,12 +47,18 @@ export class LeaderboardService {
         losses,
         total_matches: totalMatches,
         win_rate: totalMatches > 0 ? (wins / totalMatches) * 100 : 0,
-        placement_matches_played: p.placement_matches_played ?? 0,
+        placement_matches_played: eloError
+          ? (p.placement_matches_played ?? 0)
+          : Math.min(counts.get(p.id) ?? 0, PLACEMENT_MATCHES_REQUIRED),
       };
     });
   }
 
-  /** Leaderboard for a specific semester (ELO resets per semester). */
+  /**
+   * Leaderboard for a specific semester (ELO resets per semester).
+   * Intentionally reads the cached placement_matches_played counter and so
+   * depends on matches/elo_history being tagged with the correct semester_id.
+   */
   async getBySemester(semesterId: string, gender?: string) {
     let query = this.supabase.db
       .from('player_semester_stats')

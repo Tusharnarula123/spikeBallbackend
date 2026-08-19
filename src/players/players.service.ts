@@ -4,7 +4,7 @@ import { v2 as cloudinary } from 'cloudinary';
 import { ClerkService } from '../auth/clerk.service';
 import { ClerkUser } from '../auth/auth.types';
 import { apiError } from '../common/api-error';
-import { DEFAULT_ELO } from '../common/config';
+import { DEFAULT_ELO, PLACEMENT_MATCHES_REQUIRED } from '../common/config';
 import { getPlayerByClerkId } from '../common/player.helpers';
 import { MailService } from '../lib/mail.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -157,28 +157,36 @@ export class PlayersService {
     if (error) apiError(error.message, HttpStatus.INTERNAL_SERVER_ERROR);
     if (!data) apiError('Player not found', HttpStatus.NOT_FOUND);
 
-    // Override placement_matches_played from the active semester's stats.
-    // The players table value can be stale (0) for players whose matches
-    // were approved before the sync fix was deployed.
-    const { data: activeSem } = await this.supabase.db
-      .from('semesters')
-      .select('id')
-      .eq('is_active', true)
-      .maybeSingle();
-
-    if (activeSem) {
-      const { data: pss } = await this.supabase.db
-        .from('player_semester_stats')
-        .select('placement_matches_played')
-        .eq('player_id', data.id)
-        .eq('semester_id', activeSem.id)
-        .maybeSingle();
-
-      // Always override — player_semester_stats is the source of truth
-      data.placement_matches_played = pss?.placement_matches_played ?? 0;
-    }
+    // Counted from elo_history rather than the cached stats column, which
+    // reads 0 whenever a match was approved against a different semester.
+    data.placement_matches_played = await this.placementCount(data.id);
 
     return data;
+  }
+
+  /**
+   * Placement matches played, counted from ALL elo_history rows for the player.
+   *
+   * player_semester_stats.placement_matches_played is a cached counter that
+   * drifts to 0 whenever a match was approved against a different semester.
+   * elo_history has exactly one row per player per ELO-affecting match, so it
+   * is the ground truth — but historical rows carry wrong-or-null
+   * semester_id/season_id values from before the wiring was fixed, so ANY
+   * semester scoping (equality or "eq-or-null") undercounts and shows 0.
+   * Hence: no semester filter at all.
+   *
+   * ponytail: this is the ceiling of the lazy fix — when a new semester
+   * starts, placement is supposed to reset, and an unscoped count never will.
+   * Re-tag the historical rows (one UPDATE against elo_history) and then make
+   * this semester-scoped again.
+   */
+  private async placementCount(playerId: string): Promise<number> {
+    const { count } = await this.supabase.db
+      .from('elo_history')
+      .select('id', { count: 'exact', head: true })
+      .eq('player_id', playerId);
+
+    return Math.min(count ?? 0, PLACEMENT_MATCHES_REQUIRED);
   }
 
   async updateMe(auth: ClerkUser, body: Record<string, unknown>) {
@@ -430,19 +438,7 @@ export class PlayersService {
       rank = ((allActive ?? []).findIndex(s => s.id === id) + 1) || 0;
     }
 
-    // Placement count — read from active semester stats (source of truth).
-    const { data: activeSem } = await this.supabase.db
-      .from('semesters').select('id').eq('is_active', true).maybeSingle();
-    let placementMatchesPlayed = 0;
-    if (activeSem) {
-      const { data: pss } = await this.supabase.db
-        .from('player_semester_stats')
-        .select('placement_matches_played')
-        .eq('player_id', id)
-        .eq('semester_id', activeSem.id)
-        .maybeSingle();
-      placementMatchesPlayed = pss?.placement_matches_played ?? 0;
-    }
+    const placementMatchesPlayed = await this.placementCount(id);
 
     const totalMatches = wins + losses;
     return {
@@ -462,7 +458,7 @@ export class PlayersService {
       total_matches: totalMatches,
       win_rate: totalMatches > 0 ? (wins / totalMatches) * 100 : 0,
       placement_matches_played: placementMatchesPlayed,
-      is_ranked: placementMatchesPlayed >= 5,
+      is_ranked: placementMatchesPlayed >= PLACEMENT_MATCHES_REQUIRED,
       member_since: player.created_at,
       badges: player.player_badges,
     };

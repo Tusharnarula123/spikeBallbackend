@@ -21,6 +21,21 @@ interface GameScore {
  * is moot once a team already has 2 wins, so players don't have to play it.
  * Two entries split 1-1 aren't enough on their own; that needs a 3rd game.
  */
+/**
+ * Reads affects_elo off an embedded tournament. PostgREST returns a
+ * to-one embed as an object, but as a single-element array in some shapes;
+ * reading `.affects_elo` off an array silently yields undefined, which used
+ * to make every match look competitive.
+ * Returns undefined when there's no tournament (a standalone match).
+ */
+export function tournamentAffectsElo(embed: unknown): boolean | undefined {
+  if (!embed) return undefined;
+  const row = Array.isArray(embed) ? embed[0] : embed;
+  if (!row) return undefined;
+  const value = (row as { affects_elo?: unknown }).affects_elo;
+  return typeof value === 'boolean' ? value : undefined;
+}
+
 function computeResultFromGames(games: GameScore[]): {
   winningTeam: 1 | 2;
   scoreTeam1: number;
@@ -320,13 +335,19 @@ export class MatchesService {
       .order('submitted_at', { ascending: false })
       .limit(100);
 
-    if (semesterId) query = query.eq('semester_id', semesterId);
-    else if (seasonId) query = query.eq('season_id', seasonId);
-
     const { data: matches, error } = await query;
     if (error) apiError(error.message);
 
-    const rows = matches ?? [];
+    // Season/semester scoping happens here rather than in the query: the
+    // player-membership filter already uses `or`, and a second `.or()` sends a
+    // second `or=` param whose AND-ing behaviour isn't guaranteed. Legacy
+    // matches carry null ids and must still be listed — dropping them is how
+    // matches "disappeared" from the default Current Season view.
+    const rows = (matches ?? []).filter((m) => {
+      if (semesterId) return m.semester_id === semesterId || m.semester_id == null;
+      if (seasonId) return m.season_id === seasonId || m.season_id == null;
+      return true;
+    });
     if (rows.length === 0) return [];
 
     const ids = new Set<string>();
@@ -385,7 +406,12 @@ export class MatchesService {
             : null,
         myScore,
         opponentScore,
-        competitive: m.tournament ? m.tournament.affects_elo !== false : true,
+        // A match counts as competitive if it actually moved ELO. An
+        // elo_history row is the proof, so prefer it; the tournament's
+        // affects_elo flag is only a fallback for matches not yet approved.
+        // (The embed can come back as an object or a single-element array
+        // depending on how PostgREST resolves the FK — handle both.)
+        competitive: eloMap.has(m.id) ? true : tournamentAffectsElo(m.tournament) !== false,
         eloChange: eloMap.get(m.id) ?? null,
         partners: partnerIds.map((id) => ({ id, name: nameMap.get(id) ?? 'Unknown' })),
         // Kept for existing callers: the first teammate, or null if somehow alone.
